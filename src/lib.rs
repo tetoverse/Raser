@@ -2,10 +2,12 @@ pub mod app;
 pub mod audio_core;
 pub mod discord;
 pub mod i18n;
+pub mod integrations;
 pub mod local_files;
 pub mod providers;
 pub mod storage;
 pub mod taskbar;
+pub mod theme;
 pub mod ui;
 pub mod updater;
 
