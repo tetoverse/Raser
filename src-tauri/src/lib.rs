@@ -1,10 +1,12 @@
 mod audio_core;
+mod bg_queue;
 mod discord;
 mod local_files;
 mod storage;
 mod taskbar;
 mod updater;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -12,6 +14,9 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+
+static ALLOW_EXIT: AtomicBool = AtomicBool::new(false);
+static WINDOW_TRANSITIONING: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 async fn rust_audio_load(
@@ -134,15 +139,180 @@ fn toggle_fullscreen_window(window: tauri::Window) {
 }
 
 #[tauri::command]
-fn close_window(window: tauri::Window) {
-    // Hide to system tray instead of closing process so playback continues
-    set_webview_visibility(window.app_handle(), false);
-    let _ = window.hide();
-    trim_working_set();
+fn sync_playback_snapshot(
+    bg_queue: tauri::State<Arc<bg_queue::BackgroundQueue>>,
+    snapshot: bg_queue::PlaybackSnapshot,
+) {
+    bg_queue.update_snapshot(snapshot);
+}
+
+#[tauri::command]
+fn get_resume_snapshot(
+    bg_queue: tauri::State<Arc<bg_queue::BackgroundQueue>>,
+    audio_core: tauri::State<Arc<audio_core::AudioCore>>,
+) -> Option<bg_queue::ResumePayload> {
+    bg_queue.build_resume_payload(audio_core.get_state())
+}
+
+#[tauri::command]
+fn set_tray_on_close(bg_queue: tauri::State<Arc<bg_queue::BackgroundQueue>>, enabled: bool) {
+    bg_queue.set_tray_on_close(enabled);
+}
+
+#[tauri::command]
+fn set_low_ram_tray(bg_queue: tauri::State<Arc<bg_queue::BackgroundQueue>>, enabled: bool) {
+    bg_queue.set_low_ram_tray(enabled);
+}
+
+fn attach_main_window_handlers(window: &tauri::WebviewWindow) {
+    let w_clone = window.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Resized(_) => {
+            if let Ok(minimized) = w_clone.is_minimized() {
+                if minimized {
+                    let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(false);");
+                    trim_working_set();
+                } else {
+                    let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
+                }
+            }
+        }
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            let app = w_clone.app_handle().clone();
+            let should_tray = app
+                .try_state::<Arc<bg_queue::BackgroundQueue>>()
+                .map(|q| q.tray_on_close())
+                .unwrap_or(true);
+            if should_tray {
+                api.prevent_close();
+                std::thread::spawn(move || {
+                    suspend_to_tray(&app);
+                });
+            } else {
+                ALLOW_EXIT.store(true, Ordering::SeqCst);
+            }
+        }
+        _ => {}
+    });
+}
+
+fn suspend_to_tray(app: &tauri::AppHandle) {
+    if WINDOW_TRANSITIONING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct TransitionGuard;
+    impl Drop for TransitionGuard {
+        fn drop(&mut self) {
+            WINDOW_TRANSITIONING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = TransitionGuard;
+
+    let low_ram = app
+        .try_state::<Arc<bg_queue::BackgroundQueue>>()
+        .map(|q| q.low_ram_tray())
+        .unwrap_or(true);
+
+    if low_ram {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.eval("window.__raserSyncSnapshotNow && window.__raserSyncSnapshotNow();");
+            std::thread::sleep(std::time::Duration::from_millis(90));
+        }
+        taskbar::win::clear_hwnd();
+        if let Some(q) = app.try_state::<Arc<bg_queue::BackgroundQueue>>() {
+            q.set_headless(true);
+        }
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.destroy();
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            do_trim_working_set();
+        });
+    } else {
+        set_webview_visibility(app, false);
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.hide();
+        }
+        trim_working_set();
+    }
+}
+
+fn restore_main_window(app: &tauri::AppHandle) {
+    if WINDOW_TRANSITIONING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct TransitionGuard;
+    impl Drop for TransitionGuard {
+        fn drop(&mut self) {
+            WINDOW_TRANSITIONING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = TransitionGuard;
+
+    if let Some(w) = app.get_webview_window("main") {
+        if let Some(q) = app.try_state::<Arc<bg_queue::BackgroundQueue>>() {
+            q.set_headless(false);
+        }
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
+        return;
+    }
+
+    let initial_storage = storage::read_storage_raw();
+    let resume_json = match (
+        app.try_state::<Arc<bg_queue::BackgroundQueue>>(),
+        app.try_state::<Arc<audio_core::AudioCore>>(),
+    ) {
+        (Some(q), Some(ac)) => {
+            q.set_headless(false);
+            q.build_resume_payload(ac.get_state())
+                .and_then(|p| serde_json::to_string(&p).ok())
+                .unwrap_or_else(|| "null".to_string())
+        }
+        _ => "null".to_string(),
+    };
+
+    let init_script = format!(
+        "window.__RASER_INITIAL_STORAGE__ = {};\nwindow.__RASER_RESUME_SNAPSHOT__ = {};",
+        initial_storage, resume_json
+    );
+
+    if let Some(cfg) = app.config().app.windows.first() {
+        if let Ok(builder) = tauri::WebviewWindowBuilder::from_config(app, cfg) {
+            if let Ok(window) = builder.initialization_script(&init_script).build() {
+                attach_main_window_handlers(&window);
+                let _ = window.show();
+                let _ = window.set_focus();
+
+                let is_tr = is_tr_locale();
+                taskbar::win::setup_taskbar_buttons(app, is_tr);
+                if let Some(ac) = app.try_state::<Arc<audio_core::AudioCore>>() {
+                    taskbar::win::update_playback_state(ac.get_state().playing, is_tr);
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn close_window(window: tauri::Window, bg_queue: tauri::State<Arc<bg_queue::BackgroundQueue>>) {
+    if !bg_queue.tray_on_close() {
+        ALLOW_EXIT.store(true, Ordering::SeqCst);
+        std::process::exit(0);
+    }
+    let app = window.app_handle().clone();
+    // Destroy WebView2 asynchronously so this IPC call completes cleanly first
+    std::thread::spawn(move || {
+        suspend_to_tray(&app);
+    });
 }
 
 #[tauri::command]
 fn exit_app() {
+    ALLOW_EXIT.store(true, Ordering::SeqCst);
     std::process::exit(0);
 }
 
@@ -326,22 +496,76 @@ fn is_tr_locale() -> bool {
 }
 
 fn send_media_command(app: &tauri::AppHandle, cmd: &str) {
-    let _ = app.emit("media-command", cmd);
     if let Some(window) = app.get_webview_window("main") {
+        let _ = app.emit("media-command", cmd);
         let script = format!("window.__raserMediaCommand && window.__raserMediaCommand('{}');", cmd);
         let _ = window.eval(&script);
+        return;
+    }
+
+    // Headless tray mode (WebView2 destroyed): handle media commands directly in Rust
+    if let (Some(bg_queue), Some(audio_core)) = (
+        app.try_state::<Arc<bg_queue::BackgroundQueue>>(),
+        app.try_state::<Arc<audio_core::AudioCore>>(),
+    ) {
+        match cmd {
+            "next" => bg_queue::spawn_headless_step(
+                Arc::clone(bg_queue.inner()),
+                Arc::clone(audio_core.inner()),
+                1,
+                false,
+            ),
+            "prev" => bg_queue::spawn_headless_step(
+                Arc::clone(bg_queue.inner()),
+                Arc::clone(audio_core.inner()),
+                -1,
+                false,
+            ),
+            "toggle" => {
+                let playing = audio_core.get_state().playing;
+                if let Some(track) = bg_queue.current_track() {
+                    bg_queue::update_discord_for_track(&bg_queue, &track, playing);
+                } else if !playing {
+                    discord::clear_presence();
+                }
+            }
+            "stop" => {
+                discord::clear_presence();
+            }
+            _ => {}
+        }
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let audio_core = Arc::new(audio_core::AudioCore::new());
+    let bg_queue = Arc::new(bg_queue::BackgroundQueue::new());
     let audio_core_global = Arc::clone(&audio_core);
     let audio_core_tray = Arc::clone(&audio_core);
     let audio_core_monitor = Arc::clone(&audio_core);
+    let bg_queue_monitor = Arc::clone(&bg_queue);
 
-    tauri::Builder::default()
+    // Load persisted tray preferences on cold startup
+    let boot_storage = storage::read_storage_map();
+    if let Some(v) = boot_storage.get("riff_tray_on_close") {
+        let enabled = v
+            .as_bool()
+            .or_else(|| v.as_str().map(|s| s == "true" || s == "1"))
+            .unwrap_or(true);
+        bg_queue.set_tray_on_close(enabled);
+    }
+    if let Some(v) = boot_storage.get("riff_low_ram_tray") {
+        let enabled = v
+            .as_bool()
+            .or_else(|| v.as_str().map(|s| s != "false" && s != "0"))
+            .unwrap_or(true);
+        bg_queue.set_low_ram_tray(enabled);
+    }
+
+    let app = tauri::Builder::default()
         .manage(Arc::clone(&audio_core))
+        .manage(Arc::clone(&bg_queue))
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -381,6 +605,10 @@ pub fn run() {
             get_disk_storage,
             save_disk_storage,
             trim_working_set,
+            sync_playback_snapshot,
+            get_resume_snapshot,
+            set_tray_on_close,
+            set_low_ram_tray,
             rust_audio_load,
             rust_audio_play,
             rust_audio_pause,
@@ -431,12 +659,8 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.unminimize();
-                                let _ = w.set_focus();
-                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
-                            }
+                            let app_h = app.clone();
+                            std::thread::spawn(move || restore_main_window(&app_h));
                         }
                         "toggle_play" => {
                             let _ = audio_core_tray.toggle();
@@ -445,6 +669,7 @@ pub fn run() {
                         "next_track" => send_media_command(app, "next"),
                         "prev_track" => send_media_command(app, "prev"),
                         "quit" => {
+                            ALLOW_EXIT.store(true, Ordering::SeqCst);
                             std::process::exit(0);
                         }
                         _ => {}
@@ -457,18 +682,15 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
-                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(false);");
-                                let _ = w.hide();
-                                trim_working_set();
-                            } else {
-                                let _ = w.show();
-                                let _ = w.unminimize();
-                                let _ = w.set_focus();
-                                let _ = w.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
-                            }
+                        let app = tray.app_handle().clone();
+                        let is_visible = app
+                            .get_webview_window("main")
+                            .and_then(|w| w.is_visible().ok())
+                            .unwrap_or(false);
+                        if is_visible {
+                            std::thread::spawn(move || suspend_to_tray(&app));
+                        } else {
+                            std::thread::spawn(move || restore_main_window(&app));
                         }
                     }
                 });
@@ -484,24 +706,11 @@ pub fn run() {
                 let script = format!("window.__RASER_INITIAL_STORAGE__ = {};", initial_storage);
                 let _ = window.eval(&script);
                 let _ = window.show();
-
-                let w_clone = window.clone();
-                window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::Resized(_) => {
-                        if let Ok(minimized) = w_clone.is_minimized() {
-                            if minimized {
-                                let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(false);");
-                                trim_working_set();
-                            } else {
-                                let _ = w_clone.eval("window.__raserSetVisibility && window.__raserSetVisibility(true);");
-                            }
-                        }
-                    }
-                    _ => {}
-                });
+                attach_main_window_handlers(&window);
             }
 
-            // Continuous background audio monitor: sync taskbar thumbnail play/pause and notify on track end
+            // Continuous background audio monitor: sync taskbar thumbnail play/pause,
+            // notify JS on track end, or auto-advance in Rust when WebView2 is suspended to tray.
             let app_handle_audio = app.handle().clone();
             let is_tr = is_tr_locale();
             std::thread::spawn(move || {
@@ -517,9 +726,16 @@ pub fn run() {
                     if state.ended && !last_ended {
                         last_ended = true;
                         taskbar::win::update_playback_state(false, is_tr);
-                        let _ = app_handle_audio.emit("rust-audio-ended", ());
                         if let Some(w) = app_handle_audio.get_webview_window("main") {
+                            let _ = app_handle_audio.emit("rust-audio-ended", ());
                             let _ = w.eval("window.__raserAudioEnded && window.__raserAudioEnded();");
+                        } else {
+                            bg_queue::spawn_headless_step(
+                                Arc::clone(&bg_queue_monitor),
+                                Arc::clone(&audio_core_monitor),
+                                1,
+                                true,
+                            );
                         }
                     } else if !state.ended {
                         last_ended = false;
@@ -527,16 +743,18 @@ pub fn run() {
                 }
             });
 
-            // Periodic working set memory trim ONLY when window is hidden/minimized to tray,
-            // avoiding constant page-fault thrashing (40MB <-> 380MB spikes + disk/CPU load) while visible.
+            // Periodic working set memory trim ONLY when window is hidden/minimized or suspended to tray
             let app_handle_trim = app.handle().clone();
+            let bg_queue_trim = Arc::clone(&bg_queue);
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    let should_trim = if let Some(w) = app_handle_trim.get_webview_window("main") {
+                    let should_trim = if bg_queue_trim.is_headless() {
+                        true
+                    } else if let Some(w) = app_handle_trim.get_webview_window("main") {
                         !w.is_visible().unwrap_or(true) || w.is_minimized().unwrap_or(false)
                     } else {
-                        false
+                        true
                     };
                     if should_trim {
                         trim_working_set();
@@ -545,6 +763,14 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while building tauri application");
+
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if !ALLOW_EXIT.load(Ordering::SeqCst) {
+                api.prevent_exit();
+            }
+        }
+    });
 }

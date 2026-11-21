@@ -245,6 +245,10 @@ pub mod win {
         }
     }
 
+    pub fn clear_hwnd() {
+        MAIN_HWND.store(0, Ordering::SeqCst);
+    }
+
     pub fn setup_taskbar_buttons(app: &AppHandle, is_tr: bool) {
         let _ = APP_HANDLE.set(app.clone());
         if let Some(window) = app.get_webview_window("main") {
@@ -253,19 +257,26 @@ pub mod win {
                 MAIN_HWND.store(hwnd_val, Ordering::SeqCst);
 
                 unsafe {
-                    let mut taskbar_ptr: *mut c_void = std::ptr::null_mut();
-                    let hr = CoCreateInstance(
-                        &CLSID_TASKBAR_LIST,
-                        std::ptr::null_mut(),
-                        1, // CLSCTX_INPROC_SERVER
-                        &IID_ITASKBAR_LIST3,
-                        &mut taskbar_ptr,
-                    );
+                    let mut taskbar_ptr = TASKBAR_LIST.load(Ordering::SeqCst) as *mut c_void;
+                    if taskbar_ptr.is_null() {
+                        let hr = CoCreateInstance(
+                            &CLSID_TASKBAR_LIST,
+                            std::ptr::null_mut(),
+                            1, // CLSCTX_INPROC_SERVER
+                            &IID_ITASKBAR_LIST3,
+                            &mut taskbar_ptr,
+                        );
+                        if hr >= 0 && !taskbar_ptr.is_null() {
+                            let taskbar = taskbar_ptr as *mut ITaskbarList3;
+                            let _ = ((*(*taskbar).vtbl).hr_init)(taskbar_ptr);
+                            TASKBAR_LIST.store(taskbar_ptr as isize, Ordering::SeqCst);
+                        } else {
+                            taskbar_ptr = std::ptr::null_mut();
+                        }
+                    }
 
-                    if hr >= 0 && !taskbar_ptr.is_null() {
+                    if !taskbar_ptr.is_null() {
                         let taskbar = taskbar_ptr as *mut ITaskbarList3;
-                        let _ = ((*(*taskbar).vtbl).hr_init)(taskbar_ptr);
-                        TASKBAR_LIST.store(taskbar_ptr as isize, Ordering::SeqCst);
 
                         let tip_prev = if is_tr { "Önceki Şarkı" } else { "Previous Track" };
                         let tip_play = if is_tr { "Oynat / Durdur" } else { "Play / Pause" };
@@ -356,6 +367,7 @@ pub mod win {
 #[cfg(not(target_os = "windows"))]
 pub mod win {
     use tauri::AppHandle;
+    pub fn clear_hwnd() {}
     pub fn setup_taskbar_buttons(_app: &AppHandle, _is_tr: bool) {}
     pub fn update_playback_state(_playing: bool, _is_tr: bool) {}
 }

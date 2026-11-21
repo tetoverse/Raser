@@ -4947,6 +4947,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     updateQueueBadge();
     if (state.currentView === 'queue') renderQueueView();
+    if (typeof syncPlaybackSnapshotToRust === 'function') syncPlaybackSnapshotToRust();
 
     track.playedAt = Date.now();
     state.history = state.history.filter(t => !isSameTrack(t, track));
@@ -18432,6 +18433,24 @@ function bindCoverHoldZoom(wrapEl) {
     window.electronAPI.setTrayOnClose(savedTrayOnClose);
   }
 
+  const btnLowRamTray = document.getElementById('btn-low-ram-tray');
+  const storedLowRamTray = localStorage.getItem('riff_low_ram_tray');
+  const savedLowRamTray = storedLowRamTray !== null ? storedLowRamTray !== 'false' : true;
+  if (btnLowRamTray) {
+    btnLowRamTray.classList.toggle('active', savedLowRamTray);
+    btnLowRamTray.addEventListener('click', () => {
+      const next = !btnLowRamTray.classList.contains('active');
+      btnLowRamTray.classList.toggle('active', next);
+      localStorage.setItem('riff_low_ram_tray', next ? 'true' : 'false');
+      if (window.electronAPI && window.electronAPI.setLowRamTray) {
+        window.electronAPI.setLowRamTray(next);
+      }
+    });
+  }
+  if (window.electronAPI && window.electronAPI.setLowRamTray) {
+    window.electronAPI.setLowRamTray(savedLowRamTray);
+  }
+
   const btnMultiInstance = document.getElementById('btn-multi-instance');
   if (btnMultiInstance && window.electronAPI && window.electronAPI.getMultiInstance) {
     window.electronAPI.getMultiInstance().then((on) => btnMultiInstance.classList.toggle('active', !!on));
@@ -28259,6 +28278,127 @@ function bindCoverHoldZoom(wrapEl) {
     });
   }
 
+  let _rustSnapshotTimer = null;
+  function buildRustPlaybackSnapshot() {
+    const safeQueue = Array.isArray(state.queue)
+      ? state.queue.slice(0, 250).map(t => {
+          if (!t || typeof t !== 'object') return null;
+          const out = { ...t };
+          delete out._blobUrl;
+          return out;
+        }).filter(Boolean)
+      : [];
+    return {
+      queue: safeQueue,
+      queueIndex: typeof state.queueIndex === 'number' ? state.queueIndex : -1,
+      repeatMode: state.repeatMode || 'off',
+      isShuffle: !!state.isShuffle,
+      platform: state.platform || 'ytmusic',
+      apiBaseUrl: getApiBaseUrl(),
+      audioQuality: localStorage.getItem('riff_audio_quality') || 'medium',
+      currentView: state.currentView || 'discover',
+      currentPlaylistId: state.currentPlaylistId || null,
+      discordRpcEnabled: localStorage.getItem('riff_discord_rpc') !== '0',
+      discordArtistInStatus: localStorage.getItem('riff_discord_artist_status') !== '0'
+    };
+  }
+
+  function syncPlaybackSnapshotToRust(immediate = false) {
+    if (!window.electronAPI || typeof window.electronAPI.syncPlaybackSnapshot !== 'function') {
+      return Promise.resolve();
+    }
+    const pushNow = () => {
+      try {
+        return window.electronAPI.syncPlaybackSnapshot(buildRustPlaybackSnapshot()).catch(() => {});
+      } catch (_) {
+        return Promise.resolve();
+      }
+    };
+    if (immediate) {
+      if (_rustSnapshotTimer) {
+        clearTimeout(_rustSnapshotTimer);
+        _rustSnapshotTimer = null;
+      }
+      return pushNow();
+    }
+    if (_rustSnapshotTimer) clearTimeout(_rustSnapshotTimer);
+    _rustSnapshotTimer = setTimeout(() => {
+      _rustSnapshotTimer = null;
+      pushNow();
+    }, 120);
+    return Promise.resolve();
+  }
+  window.__raserSyncSnapshotNow = () => syncPlaybackSnapshotToRust(true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) syncPlaybackSnapshotToRust(true);
+  });
+
+  function resumeFromRustSnapshotIfPresent() {
+    const payload = window.__RASER_RESUME_SNAPSHOT__;
+    if (!payload || !payload.wasResumed || !payload.snapshot) return;
+    window.__RASER_RESUME_SNAPSHOT__ = null;
+
+    const snap = payload.snapshot;
+    const audioSt = payload.audioState || {};
+    if (Array.isArray(snap.queue) && snap.queue.length > 0) {
+      state.queue = snap.queue;
+      state.queueIndex = (typeof snap.queueIndex === 'number' && snap.queueIndex >= 0 && snap.queueIndex < snap.queue.length)
+        ? snap.queueIndex
+        : 0;
+    }
+    if (snap.repeatMode === 'off' || snap.repeatMode === 'all' || snap.repeatMode === 'one') {
+      state.repeatMode = snap.repeatMode;
+      state.isRepeat = snap.repeatMode !== 'off';
+    }
+    state.isShuffle = !!snap.isShuffle;
+
+    const activeTrack = (state.queueIndex >= 0 && state.queue[state.queueIndex]) ? state.queue[state.queueIndex] : null;
+    if (activeTrack) {
+      state.currentTrack = activeTrack;
+      state.isPlaying = !!audioSt.playing;
+      state.lyricsManualOffset = typeof getTrackLyricsOffset === 'function' ? getTrackLyricsOffset(activeTrack) : 0;
+      if (typeof updateLyricsOffsetUI === 'function') updateLyricsOffsetUI();
+
+      // Attach to already-running Rust AudioCore without reloading or interrupting audio!
+      if (typeof window.__raserAttachRunningAudio === 'function') {
+        window.__raserAttachRunningAudio(audioSt, activeTrack);
+      } else {
+        setTimeout(() => {
+          if (typeof window.__raserAttachRunningAudio === 'function') {
+            window.__raserAttachRunningAudio(audioSt, activeTrack);
+          }
+        }, 120);
+      }
+
+      updateNowPlayingUI(activeTrack);
+      updatePlayPauseButton(!!audioSt.playing, false);
+      updateQueueBadge();
+
+      const pos = typeof audioSt.position === 'number' ? audioSt.position : 0;
+      const dur = (typeof audioSt.duration === 'number' && audioSt.duration > 0)
+        ? audioSt.duration
+        : (activeTrack.duration || 0);
+      if (el.timeCurrent) el.timeCurrent.textContent = formatDuration(pos);
+      if (el.tvkTimeCurrent) el.tvkTimeCurrent.textContent = formatDuration(pos);
+      if (el.timeDuration) el.timeDuration.textContent = formatDuration(dur);
+      if (el.tvkTimeDuration) el.tvkTimeDuration.textContent = formatDuration(dur);
+
+      try { loadSyncedLyrics(activeTrack.title, activeTrack.artist, ++state.loadToken); } catch (_) {}
+      try { applyVisualEffects(); } catch (_) {}
+    }
+
+    if (snap.currentView && snap.currentView !== 'discover') {
+      try {
+        if (snap.currentView === 'playlist-detail' && snap.currentPlaylistId && typeof openPlaylistDetail === 'function') {
+          openPlaylistDetail(snap.currentPlaylistId);
+        } else if (typeof switchView === 'function') {
+          switchView(snap.currentView);
+        }
+      } catch (_) {}
+    }
+  }
+
+  resumeFromRustSnapshotIfPresent();
   emitPluginEvent('ready');
 });
 

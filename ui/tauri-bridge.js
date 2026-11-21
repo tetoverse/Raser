@@ -44,7 +44,21 @@
     platform: 'win32',
     minimizeWindow: () => invoke('minimize_window'),
     maximizeWindow: () => invoke('toggle_maximize_window'),
-    closeWindow: () => invoke('close_window'),
+    closeWindow: async () => {
+      try {
+        if (typeof window.__raserSyncSnapshotNow === 'function') {
+          await Promise.race([
+            Promise.resolve(window.__raserSyncSnapshotNow()),
+            new Promise(r => setTimeout(r, 250))
+          ]);
+        }
+      } catch (_) {}
+      return invoke('close_window');
+    },
+    setTrayOnClose: (enabled) => invoke('set_tray_on_close', { enabled: !!enabled }),
+    setLowRamTray: (enabled) => invoke('set_low_ram_tray', { enabled: !!enabled }),
+    syncPlaybackSnapshot: (snapshot) => invoke('sync_playback_snapshot', { snapshot }),
+    getResumeSnapshot: () => invoke('get_resume_snapshot'),
     taskbarPlaybackState: (playing) => invoke('taskbar_playback_state', { playing: !!playing }),
     updateTaskbarState: (playing) => invoke('taskbar_playback_state', { playing: !!playing }),
     onMediaCommand: (cb) => {
@@ -498,16 +512,45 @@
 
     audio.load = () => {};
 
+    // Seamless zero-interruption attach when WebView2 is recreated from low-RAM tray mode
+    window.__raserAttachRunningAudio = (st, track) => {
+      if (!st) return;
+      currentLoadToken++;
+      _isLoading = !!st.loading;
+      _isSeeking = false;
+      _pendingSeekTarget = null;
+      _pendingSeekOnLoad = null;
+      _seekEpoch++;
+      _isPlaying = !!st.playing;
+      _hasEnded = !!st.ended;
+      _currentPosition = typeof st.position === 'number' ? st.position : 0;
+      const dur = (typeof st.duration === 'number' && st.duration > 0)
+        ? st.duration
+        : (track && Number.isFinite(track.duration) && track.duration > 0 ? track.duration : 0);
+      _currentDuration = dur;
+      lastDispatchedPos = _currentPosition;
+      _currentSrc = 'raser-resumed://' + encodeURIComponent((track && (track.resolvedId || track.id)) || 'active');
+      audio.dispatchEvent(new Event('loadedmetadata'));
+      audio.dispatchEvent(new Event('durationchange'));
+      audio.dispatchEvent(new Event('canplay'));
+      audio.dispatchEvent(new Event('timeupdate'));
+      if (_isPlaying) {
+        audio.dispatchEvent(new Event('play'));
+        audio.dispatchEvent(new Event('playing'));
+      }
+    };
+
     // Continuous sync loop with Rust audio core state
     let lastDispatchedPos = 0;
     let isFetchingState = false;
     let idleTicks = 0;
     setInterval(() => {
       if (isFetchingState) return;
+      // Pause polling completely when hidden/minimized (Rust monitor thread handles track end & media keys)
+      if (document.hidden) return;
       if (!_isPlaying && !_isLoading) {
-        if (document.hidden) return;
-        idleTicks = (idleTicks + 1) % 6;
-        if (idleTicks !== 0) return; // Poll only ~3.5x/sec when paused in foreground
+        idleTicks = (idleTicks + 1) % 4;
+        if (idleTicks !== 0) return; // Poll ~2.5x/sec when paused in foreground
       } else {
         idleTicks = 0;
       }
@@ -560,7 +603,7 @@
       }).catch(() => {}).finally(() => {
         isFetchingState = false;
       });
-    }, 55);
+    }, 100);
 
     // Demand-driven FFT polling via rustAudioGetFrequencyData avoids background IPC when visualizers are hidden
   };
