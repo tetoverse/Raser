@@ -255,3 +255,64 @@ fn test_seek_coordinator_coalescing_parity() {
     let queued = coord.finish_load(0.0);
     assert_eq!(queued, Some((67.0, coord.seek_epoch)));
 }
+
+#[tokio::test]
+async fn test_audio_core_stop_resets_position_and_ended_after_playback() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let wav_path = std::env::temp_dir().join(format!("raser_stop_test_{}.wav", nanos));
+    let _guard = TempFileGuard(wav_path.clone());
+    let wav_bytes = build_sine_wav_bytes(44100, 3, 440.0);
+    fs::write(&wav_path, &wav_bytes).unwrap();
+
+    let core = Arc::new(AudioCore::new());
+    let _ = core.set_volume(0.0);
+    let res = core
+        .load_audio_async(
+            wav_path.to_string_lossy().to_string(),
+            None,
+            Some(3.0),
+            true,
+            None,
+        )
+        .await;
+
+    match res {
+        Ok(_) => {
+            for _ in 0..24 {
+                if core.get_state().position > 0.16 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let before_stop = core.get_state();
+            assert!(
+                before_stop.position > 0.15,
+                "expected >0.15s playback before stop, got {}",
+                before_stop.position
+            );
+
+            core.pause().expect("pause should succeed");
+            core.stop();
+
+            let after_stop = core.get_state();
+            assert_eq!(after_stop.position, 0.0);
+            assert!(!after_stop.ended);
+            assert!(!after_stop.playing);
+            assert!(after_stop.url.is_none());
+            assert_eq!(after_stop.duration, 0.0);
+            assert!(core.get_frequency_data().iter().all(|&b| b == 0));
+        }
+        Err(e) if e.contains("default audio sink") => {
+            // Headless environment without audio device: verify stop() on fresh core clears state
+            core.stop();
+            let st = core.get_state();
+            assert_eq!(st.position, 0.0);
+            assert!(!st.ended);
+            assert!(st.url.is_none());
+        }
+        Err(e) => panic!("Unexpected load_audio_async error: {}", e),
+    }
+}
