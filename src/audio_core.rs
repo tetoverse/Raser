@@ -587,25 +587,13 @@ impl AudioCore {
 
     pub fn stop(&self) {
         self.load_generation.fetch_add(1, Ordering::SeqCst);
+        self.seek_generation.fetch_add(1, Ordering::SeqCst);
         self.is_playing.store(false, Ordering::SeqCst);
         self.is_loading.store(false, Ordering::SeqCst);
-        self.has_ended.store(false, Ordering::SeqCst);
-        self.track_has_played.store(false, Ordering::SeqCst);
-        self.seek_offset_bits.store(0.0f64.to_bits(), Ordering::SeqCst);
-        if let Ok(mut dur) = self.current_duration.lock() {
-            *dur = 0.0;
-        }
-        if let Ok(mut url) = self.current_url.lock() {
-            *url = None;
-        }
-        if let Ok(mut err) = self.current_error.lock() {
-            *err = None;
-        }
-        if let Ok(mut cb) = self.cached_bytes.lock() {
-            *cb = None;
-        }
         if let Ok(mut prog) = self.active_progressive.lock() {
-            *prog = None;
+            if let Some((old_prog, _)) = prog.take() {
+                old_prog.condvar.notify_all();
+            }
         }
         if let Ok(player_guard) = self.player.lock() {
             if let Some(player) = player_guard.as_ref() {
@@ -613,6 +601,30 @@ impl AudioCore {
                 player.pause();
             }
         }
+        if let Ok(mut c) = self.consumer.lock() {
+            *c = None;
+        }
+        if let Ok(mut samples) = self.recent_samples.lock() {
+            samples.fill(0.0);
+        }
+        if let Ok(mut url) = self.current_url.lock() {
+            *url = None;
+        }
+        if let Ok(mut dur) = self.current_duration.lock() {
+            *dur = 0.0;
+        }
+        if let Ok(mut err) = self.current_error.lock() {
+            *err = None;
+        }
+        if let Ok(mut cb) = self.cached_bytes.lock() {
+            *cb = None;
+        }
+        if let Ok(mut arc) = self.source_elapsed_bits.lock() {
+            *arc = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+        }
+        self.seek_offset_bits.store(0.0f64.to_bits(), Ordering::SeqCst);
+        self.track_has_played.store(false, Ordering::SeqCst);
+        self.has_ended.store(false, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1343,6 +1355,11 @@ impl AudioCore {
     pub fn get_state(&self) -> AudioState {
         let loading = self.is_loading.load(Ordering::SeqCst);
         let seeking = self.active_seek_count.load(Ordering::SeqCst) > 0;
+        let url = self
+            .current_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let (pos, empty) = if loading {
             (0.0, false)
         } else {
@@ -1359,7 +1376,7 @@ impl AudioCore {
             (offset + elapsed, empty)
         };
 
-        if !loading && !seeking && pos > 0.1 {
+        if !loading && !seeking && url.is_some() && pos > 0.1 {
             self.track_has_played.store(true, Ordering::SeqCst);
         }
 
@@ -1367,11 +1384,10 @@ impl AudioCore {
         let playing = self.is_playing.load(Ordering::SeqCst);
         let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
         let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
-        let url = self.current_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let error = self.current_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let track_played = self.track_has_played.load(Ordering::SeqCst);
-        let ended = if !loading && !seeking && empty && track_played {
+        let ended = if !loading && !seeking && url.is_some() && empty && track_played {
             self.has_ended.store(true, Ordering::SeqCst);
             self.is_playing.store(false, Ordering::SeqCst);
             true
