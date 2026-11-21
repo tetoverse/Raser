@@ -2397,4 +2397,131 @@ mod tests {
         let _ = app.update(Message::SearchFocused(false));
         assert!(!app.search_focused);
     }
+
+    #[test]
+    fn test_toggle_play_pause_retries_after_failed_load_without_playing_empty_player() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let guard = AppTestDirGuard::new("failed_load_retry");
+        let corrupt_path = guard.dir.join("corrupt.wav");
+        std::fs::write(&corrupt_path, b"corrupt-audio-bytes").unwrap();
+
+        let mut corrupt_track = make_playable_track("corrupt_1", "Corrupt Track");
+        corrupt_track.path = corrupt_path.to_string_lossy().to_string();
+        corrupt_track.url = corrupt_track.path.clone();
+        corrupt_track.duration = 2.0;
+
+        let (mut app, _) = RaserApp::boot(None);
+        app.queue = vec![corrupt_track.clone()];
+        app.queue_index = Some(0);
+
+        let _ = app.update(Message::TogglePlayPause);
+        let initial_epoch = app.load_epoch;
+        assert!(app.seek_coordinator.is_loading);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let load_res = rt.block_on(app.audio.load_audio_async(
+            corrupt_track.playable_source(),
+            None,
+            Some(2.0),
+            true,
+            Some(corrupt_track.id.clone()),
+        ));
+        assert!(load_res.is_err());
+
+        let _ = app.update(Message::AudioLoadFinished(initial_epoch, load_res));
+        assert!(!app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+        assert!(app.audio_state.url.is_none());
+        assert!(app.audio_state.error.is_some());
+
+        // TogglePlayPause after failed load must initiate a fresh retry instead of toggling empty player
+        let _ = app.update(Message::TogglePlayPause);
+        assert!(app.seek_coordinator.is_loading);
+        assert_eq!(app.load_epoch, initial_epoch.wrapping_add(1));
+        assert!(!app.audio_state.playing);
+
+        // With empty queue and error state, TogglePlayPause must stay idle
+        let _ = app.update(Message::AudioLoadFinished(
+            app.load_epoch,
+            Err("retry failed".to_string()),
+        ));
+        app.queue.clear();
+        app.queue_index = None;
+        let epoch_empty = app.load_epoch;
+        let _ = app.update(Message::TogglePlayPause);
+        assert!(!app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+        assert_eq!(app.load_epoch, epoch_empty);
+    }
+
+    #[test]
+    fn test_toggle_play_pause_ended_rapid_double_press_spawns_single_load() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let guard = AppTestDirGuard::new("ended_double_press");
+        let wav_path = guard.dir.join("short_end.wav");
+        build_app_test_wav(&wav_path, 1);
+
+        let mut track = make_playable_track("end_1", "Short Track");
+        track.path = wav_path.to_string_lossy().to_string();
+        track.url = track.path.clone();
+        track.duration = 1.0;
+
+        let (mut app, _) = RaserApp::boot(None);
+        let _ = app.audio.set_volume(0.0);
+        let _ = app.audio.set_speed(4.0);
+        app.snapshot.settings.advanced.autoplay = false;
+        app.snapshot.settings.repeat_mode = RepeatMode::Off;
+        app.queue = vec![track.clone()];
+        app.queue_index = Some(0);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let load_res = rt.block_on(app.audio.load_audio_async(
+            track.playable_source(),
+            None,
+            Some(1.0),
+            true,
+            Some(track.id.clone()),
+        ));
+
+        match load_res {
+            Ok(_) => {
+                for _ in 0..48 {
+                    let _ = app.update(Message::Tick);
+                    if app.audio_state.ended {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert!(app.audio_state.ended, "expected track to reach natural EOF");
+                assert!(app.audio_state.url.is_some());
+            }
+            Err(e) if e.contains("default audio sink") => {
+                // Headless CI fallback without audio device
+                app.audio.force_ended_for_test();
+                let _ = app.update(Message::Tick);
+                app.audio_state.url = Some(track.playable_source());
+                assert!(app.audio_state.ended);
+            }
+            Err(e) => panic!("Unexpected load_audio_async error: {}", e),
+        }
+
+        assert!(!app.seek_coordinator.is_loading);
+        let epoch_before = app.load_epoch;
+
+        // First press from ended == true initiates reload
+        let _ = app.update(Message::TogglePlayPause);
+        assert_eq!(app.load_epoch, epoch_before.wrapping_add(1));
+        assert!(app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+
+        // Rapid second press before AudioLoadFinished must be suppressed (Task::none)
+        let _ = app.update(Message::TogglePlayPause);
+        assert_eq!(
+            app.load_epoch,
+            epoch_before.wrapping_add(1),
+            "rapid double-press from ended == true must increment load_epoch only once"
+        );
+        assert!(app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+    }
 }
