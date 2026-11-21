@@ -2,9 +2,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use tauri::Emitter;
 
-const CURRENT_VERSION: &str = "1.1.1";
+pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION_ENDPOINT: &str = "https://app.raserapp.online/api/desktop-version";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -92,8 +91,8 @@ pub async fn check_for_update() -> Result<UpdateInfo, String> {
 }
 
 pub async fn download_and_install_update(
-    app: tauri::AppHandle,
     download_url: String,
+    progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -124,14 +123,13 @@ pub async fn download_and_install_update(
         downloaded_bytes += chunk.len() as u64;
 
         let percent = ((downloaded_bytes as f64 / total_bytes as f64) * 100.0).min(100.0) as u8;
-        let _ = app.emit(
-            "update-download-progress",
-            DownloadProgress {
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.try_send(DownloadProgress {
                 percent,
                 downloaded_bytes,
                 total_bytes,
-            },
-        );
+            });
+        }
     }
 
     file.flush().map_err(|e| e.to_string())?;

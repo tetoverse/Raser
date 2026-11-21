@@ -1,16 +1,30 @@
 // Windows Taskbar Thumbnail Toolbar (ITaskbarList3)
 // Provides Spotify-style Prev, Play/Pause, Next mini media buttons on taskbar hover preview
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCommand {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
+    ShowWindow,
+    ToggleWindow,
+    Quit,
+}
+
 #[cfg(target_os = "windows")]
 pub mod win {
+    use super::MediaCommand;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-    use tauri::{AppHandle, Emitter, Manager};
+    use std::sync::{mpsc::Sender, OnceLock};
 
-    static APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+    static MEDIA_TX: OnceLock<Sender<MediaCommand>> = OnceLock::new();
     static IS_PLAYING: AtomicBool = AtomicBool::new(false);
     static TASKBAR_LIST: AtomicIsize = AtomicIsize::new(0);
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+    static ICON_PLAY: AtomicIsize = AtomicIsize::new(0);
+    static ICON_PAUSE: AtomicIsize = AtomicIsize::new(0);
 
     const WM_COMMAND: u32 = 0x0111;
     const THBN_CLICKED: usize = 0x1800;
@@ -202,6 +216,21 @@ pub mod win {
         }
     }
 
+    fn cached_play_pause_icon(playing: bool) -> isize {
+        let slot = if playing { &ICON_PAUSE } else { &ICON_PLAY };
+        let existing = slot.load(Ordering::Acquire);
+        if existing != 0 {
+            return existing;
+        }
+        let shape = if playing { "pause" } else { "play" };
+        let created = create_media_icon(shape);
+        if created != 0 {
+            let _ = slot.compare_exchange(0, created, Ordering::AcqRel, Ordering::Acquire);
+            return slot.load(Ordering::Acquire);
+        }
+        0
+    }
+
     unsafe extern "system" fn taskbar_subclass_proc(
         hwnd: isize,
         msg: u32,
@@ -214,105 +243,89 @@ pub mod win {
             let hi = (w_param >> 16) & 0xFFFF;
             let id = w_param & 0xFFFF;
             if hi == THBN_CLICKED && (id == BTN_PREV || id == BTN_PLAY_PAUSE || id == BTN_NEXT) {
-                if let Some(app) = APP_HANDLE.get() {
-                    match id {
-                        BTN_PREV => {
-                            let _ = app.emit("media-command", "prev");
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.eval("window.__raserMediaCommand && window.__raserMediaCommand('prev');");
-                            }
-                        }
-                        BTN_PLAY_PAUSE => {
-                            let _ = app.emit("media-command", "toggle");
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.eval("window.__raserMediaCommand && window.__raserMediaCommand('toggle');");
-                            }
-                        }
-                        BTN_NEXT => {
-                            let _ = app.emit("media-command", "next");
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.eval("window.__raserMediaCommand && window.__raserMediaCommand('next');");
-                            }
-                        }
-                        _ => {}
+                if let Some(tx) = MEDIA_TX.get() {
+                    let cmd = match id {
+                        BTN_PREV => Some(MediaCommand::Previous),
+                        BTN_PLAY_PAUSE => Some(MediaCommand::PlayPause),
+                        BTN_NEXT => Some(MediaCommand::Next),
+                        _ => None,
+                    };
+                    if let Some(c) = cmd {
+                        let _ = tx.send(c);
                     }
                 }
                 return 0;
             }
         }
-        unsafe {
-            DefSubclassProc(hwnd, msg, w_param, l_param)
-        }
+        unsafe { DefSubclassProc(hwnd, msg, w_param, l_param) }
     }
 
-    pub fn setup_taskbar_buttons(app: &AppHandle, is_tr: bool) {
-        let _ = APP_HANDLE.set(app.clone());
-        if let Some(window) = app.get_webview_window("main") {
-            if let Ok(hwnd) = window.hwnd() {
-                let hwnd_val = hwnd.0 as isize;
-                MAIN_HWND.store(hwnd_val, Ordering::SeqCst);
+    pub fn setup_taskbar_buttons(hwnd_val: isize, is_tr: bool, tx: Sender<MediaCommand>) {
+        let _ = MEDIA_TX.set(tx);
+        if hwnd_val == 0 {
+            return;
+        }
+        MAIN_HWND.store(hwnd_val, Ordering::SeqCst);
 
-                unsafe {
-                    let mut taskbar_ptr: *mut c_void = std::ptr::null_mut();
-                    let hr = CoCreateInstance(
-                        &CLSID_TASKBAR_LIST,
-                        std::ptr::null_mut(),
-                        1, // CLSCTX_INPROC_SERVER
-                        &IID_ITASKBAR_LIST3,
-                        &mut taskbar_ptr,
-                    );
+        unsafe {
+            let mut taskbar_ptr: *mut c_void = std::ptr::null_mut();
+            let hr = CoCreateInstance(
+                &CLSID_TASKBAR_LIST,
+                std::ptr::null_mut(),
+                1, // CLSCTX_INPROC_SERVER
+                &IID_ITASKBAR_LIST3,
+                &mut taskbar_ptr,
+            );
 
-                    if hr >= 0 && !taskbar_ptr.is_null() {
-                        let taskbar = taskbar_ptr as *mut ITaskbarList3;
-                        let _ = ((*(*taskbar).vtbl).hr_init)(taskbar_ptr);
-                        TASKBAR_LIST.store(taskbar_ptr as isize, Ordering::SeqCst);
+            if hr >= 0 && !taskbar_ptr.is_null() {
+                let taskbar = taskbar_ptr as *mut ITaskbarList3;
+                let _ = ((*(*taskbar).vtbl).hr_init)(taskbar_ptr);
+                TASKBAR_LIST.store(taskbar_ptr as isize, Ordering::SeqCst);
 
-                        let tip_prev = if is_tr { "Önceki Şarkı" } else { "Previous Track" };
-                        let tip_play = if is_tr { "Oynat / Durdur" } else { "Play / Pause" };
-                        let tip_next = if is_tr { "Sonraki Şarkı" } else { "Next Track" };
+                let tip_prev = if is_tr { "Önceki Şarkı" } else { "Previous Track" };
+                let tip_play = if is_tr { "Oynat / Durdur" } else { "Play / Pause" };
+                let tip_next = if is_tr { "Sonraki Şarkı" } else { "Next Track" };
 
-                        let h_icon_prev = create_media_icon("prev");
-                        let h_icon_play = create_media_icon("play");
-                        let h_icon_next = create_media_icon("next");
+                let h_icon_prev = create_media_icon("prev");
+                let h_icon_play = cached_play_pause_icon(false);
+                let h_icon_next = create_media_icon("next");
 
-                        let buttons: [ThumbButton; 3] = [
-                            ThumbButton {
-                                dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
-                                i_id: BTN_PREV as u32,
-                                i_bitmap: 0,
-                                h_icon: h_icon_prev,
-                                sz_tip: to_sz_tip(tip_prev),
-                                dw_flags: THBF_ENABLED,
-                            },
-                            ThumbButton {
-                                dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
-                                i_id: BTN_PLAY_PAUSE as u32,
-                                i_bitmap: 0,
-                                h_icon: h_icon_play,
-                                sz_tip: to_sz_tip(tip_play),
-                                dw_flags: THBF_ENABLED,
-                            },
-                            ThumbButton {
-                                dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
-                                i_id: BTN_NEXT as u32,
-                                i_bitmap: 0,
-                                h_icon: h_icon_next,
-                                sz_tip: to_sz_tip(tip_next),
-                                dw_flags: THBF_ENABLED,
-                            },
-                        ];
+                let buttons: [ThumbButton; 3] = [
+                    ThumbButton {
+                        dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
+                        i_id: BTN_PREV as u32,
+                        i_bitmap: 0,
+                        h_icon: h_icon_prev,
+                        sz_tip: to_sz_tip(tip_prev),
+                        dw_flags: THBF_ENABLED,
+                    },
+                    ThumbButton {
+                        dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
+                        i_id: BTN_PLAY_PAUSE as u32,
+                        i_bitmap: 0,
+                        h_icon: h_icon_play,
+                        sz_tip: to_sz_tip(tip_play),
+                        dw_flags: THBF_ENABLED,
+                    },
+                    ThumbButton {
+                        dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
+                        i_id: BTN_NEXT as u32,
+                        i_bitmap: 0,
+                        h_icon: h_icon_next,
+                        sz_tip: to_sz_tip(tip_next),
+                        dw_flags: THBF_ENABLED,
+                    },
+                ];
 
-                        let _ = ((*(*taskbar).vtbl).thumb_bar_add_buttons)(
-                            taskbar_ptr,
-                            hwnd_val,
-                            3,
-                            buttons.as_ptr(),
-                        );
+                let _ = ((*(*taskbar).vtbl).thumb_bar_add_buttons)(
+                    taskbar_ptr,
+                    hwnd_val,
+                    3,
+                    buttons.as_ptr(),
+                );
 
-                        // Hook window messages to capture thumbnail button clicks
-                        SetWindowSubclass(hwnd_val, taskbar_subclass_proc, 4242, 0);
-                    }
-                }
+                // Hook window messages to capture thumbnail button clicks
+                SetWindowSubclass(hwnd_val, taskbar_subclass_proc, 4242, 0);
             }
         }
     }
@@ -325,14 +338,13 @@ pub mod win {
         if taskbar_ptr != 0 && hwnd_val != 0 {
             unsafe {
                 let taskbar = taskbar_ptr as *mut ITaskbarList3;
-                let shape = if playing { "pause" } else { "play" };
                 let tip = if playing {
                     if is_tr { "Durdur" } else { "Pause" }
                 } else {
                     if is_tr { "Oynat" } else { "Play" }
                 };
 
-                let h_icon = create_media_icon(shape);
+                let h_icon = cached_play_pause_icon(playing);
                 let btn = ThumbButton {
                     dw_mask: THB_ICON | THB_TOOLTIP | THB_FLAGS,
                     i_id: BTN_PLAY_PAUSE as u32,
@@ -355,7 +367,8 @@ pub mod win {
 
 #[cfg(not(target_os = "windows"))]
 pub mod win {
-    use tauri::AppHandle;
-    pub fn setup_taskbar_buttons(_app: &AppHandle, _is_tr: bool) {}
+    use super::MediaCommand;
+    use std::sync::mpsc::Sender;
+    pub fn setup_taskbar_buttons(_hwnd: isize, _is_tr: bool, _tx: Sender<MediaCommand>) {}
     pub fn update_playback_state(_playing: bool, _is_tr: bool) {}
 }

@@ -7,7 +7,7 @@ const CLIENT_ID: &str = "1566492575345676440";
 
 static RPC_CLIENT: Mutex<Option<DiscordIpcClient>> = Mutex::new(None);
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct DiscordTrackInfo {
     pub title: Option<String>,
     pub artist: Option<String>,

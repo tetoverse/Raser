@@ -1,9 +1,72 @@
 use crate::storage;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioSourceKind {
+    RemoteHttp(String),
+    LocalPath(PathBuf),
+}
+
+fn decode_local_path_string(raw: &str) -> PathBuf {
+    let decoded = urlencoding::decode(raw)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| raw.to_string());
+    let mut s = decoded;
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        s = stripped.to_string();
+    } else if let Some(stripped) = s.strip_prefix("//?/") {
+        s = stripped.to_string();
+    }
+    if cfg!(windows) {
+        // Strip leading slash before Windows drive letter e.g. /C:/Music -> C:/Music
+        let bytes = s.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+            s = s[1..].to_string();
+        }
+        s = s.replace('/', "\\");
+    }
+    PathBuf::from(s)
+}
+
+/// Normalize local paths, `file://` URIs, legacy `http(s)://asset.localhost/` URIs,
+/// and remote `http(s)://` stream URLs. Legacy `asset.localhost` prefixes MUST be checked
+/// before generic `http(s)://` so saved v1.2.6 local tracks are read from disk.
+pub fn normalize_audio_url(raw: &str) -> AudioSourceKind {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("http://asset.localhost/")
+        .or_else(|| trimmed.strip_prefix("https://asset.localhost/"))
+    {
+        return AudioSourceKind::LocalPath(decode_local_path_string(rest));
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return AudioSourceKind::RemoteHttp(trimmed.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("file:///") {
+        let mut p = decode_local_path_string(rest);
+        if !cfg!(windows) {
+            let s = p.to_string_lossy();
+            if !s.starts_with('/') {
+                p = PathBuf::from(format!("/{}", s));
+            }
+        }
+        return AudioSourceKind::LocalPath(p);
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost/").map(|s| format!("/{}", s)).unwrap_or_else(|| rest.to_string());
+        return AudioSourceKind::LocalPath(decode_local_path_string(&rest));
+    }
+    let direct = Path::new(trimmed);
+    if direct.exists() {
+        return AudioSourceKind::LocalPath(direct.to_path_buf());
+    }
+    AudioSourceKind::LocalPath(decode_local_path_string(trimmed))
+}
 
 use rodio::decoder::Decoder;
 use rodio::source::Source;
@@ -275,7 +338,7 @@ impl<S> VisualizerSource<S>
 where
     S: Source<Item = rodio::Sample>,
 {
-    fn new(
+    pub fn new(
         inner: S,
         producer: rtrb::Producer<f32>,
         elapsed_secs_bits: Arc<AtomicU64>,
@@ -422,6 +485,12 @@ struct SeekCountGuard(Arc<AtomicUsize>);
 impl Drop for SeekCountGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Default for AudioCore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -738,7 +807,7 @@ impl AudioCore {
     pub async fn seek_async(self: &Arc<Self>, position_secs: f64) -> Result<AudioState, String> {
         let my_seek_gen = self.begin_seek_generation();
         let this = Arc::clone(self);
-        tauri::async_runtime::spawn_blocking(move || this.seek_with_gen(position_secs, my_seek_gen))
+        tokio::task::spawn_blocking(move || this.seek_with_gen(position_secs, my_seek_gen))
             .await
             .map_err(|e| format!("Seek task execution error: {:?}", e))?
     }
@@ -890,7 +959,7 @@ impl AudioCore {
             .map(String::from)
             .or_else(|| extract_track_id_from_url(&url));
 
-        tauri::async_runtime::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut cached_bytes_opt = None;
             if let Some(ref tid) = effective_tid {
                 if let Some(cached_path) = storage::get_cached_audio_path(tid) {
@@ -906,15 +975,15 @@ impl AudioCore {
                 Progressive(Decoder<ProgressiveReader>),
             }
 
-            let loaded_decoder = if cached_bytes_opt.is_none()
-                && (url.starts_with("http://") || url.starts_with("https://"))
-            {
+            let source_kind = normalize_audio_url(&url);
+            let loaded_decoder = match source_kind {
+                AudioSourceKind::RemoteHttp(remote_url) if cached_bytes_opt.is_none() => {
                 let client = match shared_http_client() {
                     Ok(c) => c,
                     Err(e) => return Err(e),
                 };
 
-                let resp = match client.get(&url).send() {
+                let resp = match client.get(&remote_url).send() {
                     Ok(r) => r,
                     Err(e) => {
                         let err_msg = format!("Failed to fetch stream URL: {:?}", e);
@@ -1068,25 +1137,24 @@ impl AudioCore {
                     }
                 };
                 LoadedDecoder::Progressive(decoder)
-            } else {
-                let bytes_res = if let Some(b) = cached_bytes_opt {
-                    Ok(b)
-                } else {
-                    let mut path_str = if let Some(stripped) = url.strip_prefix("file:///") {
-                        stripped.replace('/', "\\")
-                    } else if let Some(stripped) = url.strip_prefix("file://") {
-                        stripped.replace('/', "\\")
+                }
+                other_kind => {
+                    let bytes_res = if let Some(b) = cached_bytes_opt {
+                        Ok(b)
                     } else {
-                        url.clone()
+                        let local_path = match other_kind {
+                            AudioSourceKind::LocalPath(p) => p,
+                            AudioSourceKind::RemoteHttp(_) => unreachable!(),
+                        };
+                        match std::fs::read(&local_path) {
+                            Ok(b) => Ok(b),
+                            Err(e) => Err(format!(
+                                "Failed to read local file '{}': {:?}",
+                                local_path.display(),
+                                e
+                            )),
+                        }
                     };
-                    if let Ok(decoded) = urlencoding::decode(&path_str) {
-                        path_str = decoded.into_owned();
-                    }
-                    match std::fs::read(&path_str) {
-                        Ok(b) => Ok(b),
-                        Err(e) => Err(format!("Failed to read local file '{}': {:?}", path_str, e)),
-                    }
-                };
 
                 if this.load_generation.load(Ordering::SeqCst) != current_gen {
                     return Err("Superseded by newer load".to_string());
@@ -1123,7 +1191,8 @@ impl AudioCore {
                         return Err(err_msg);
                     }
                 };
-                LoadedDecoder::Buffered(decoder)
+                    LoadedDecoder::Buffered(decoder)
+                }
             };
 
             let total_dur = match &loaded_decoder {
