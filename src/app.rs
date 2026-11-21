@@ -1160,11 +1160,17 @@ impl RaserApp {
                     let _ = pos;
                 }
                 let prev_ended = self.last_ended_reported;
-                self.last_ended_reported = st.ended;
+                if !self.seek_coordinator.is_loading && !st.loading {
+                    self.last_ended_reported = st.ended;
+                }
                 self.audio_state = st.clone();
 
                 // Enforce active TrackTrim during playback
-                if st.playing && !st.loading && !self.seek_coordinator.in_flight {
+                if st.playing
+                    && !st.loading
+                    && !self.seek_coordinator.is_loading
+                    && !self.seek_coordinator.in_flight
+                {
                     if let Some(tr) = self.current_track() {
                         if let Some(trim) = self.snapshot.track_trims.get(&tr.canonical_id()) {
                             if let Some(jump) = evaluate_trim_jump(trim, st.position) {
@@ -1182,7 +1188,7 @@ impl RaserApp {
                 }
 
                 // Auto-advance on track end rising edge
-                if st.ended && !prev_ended {
+                if st.ended && !prev_ended && !self.seek_coordinator.is_loading && !st.loading {
                     if self.snapshot.settings.repeat_mode == RepeatMode::One {
                         if let Some(tr) = self.current_track() {
                             return self.load_track_task(&tr, false);
