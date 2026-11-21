@@ -1,6 +1,9 @@
 use crate::audio_core::{AudioCore, AudioState};
 use crate::i18n::{detect_os_lang, Lang};
 use crate::local_files;
+use crate::providers::{
+    self, AlbumDetail, ArtistDetail, AudioQuality, DiscoverFeed, Platform, ResolvedStream,
+};
 use crate::storage::{
     self, now_millis, AppStateSnapshot, PlaylistRecord, RepeatMode, TrackRecord, TrackRename,
     TrackSortMode, TrackTrim, DEFAULT_SIDEBAR_ORDER,
@@ -8,6 +11,7 @@ use crate::storage::{
 use crate::ui::{
     playbar, sidebar, titlebar, views, M3Palette, CORNER_XL, SIDEBAR_CLASSIC_WIDTH,
 };
+use crate::updater::{self, UpdateInfo};
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::mouse;
 use iced::widget::{column, container, operation, row, stack};
@@ -20,12 +24,15 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveView {
     Discover,
+    Search,
     Favorites,
     Albums,
     Local,
     History,
     Queue,
     PlaylistDetail(String),
+    ArtistDetail(String),
+    AlbumDetail { title: String, artist: String },
     Settings,
 }
 
@@ -85,6 +92,7 @@ pub struct CliOptions {
 pub fn parse_view_flag(val: &str) -> Option<ActiveView> {
     match val.trim().to_ascii_lowercase().as_str() {
         "discover" | "home" => Some(ActiveView::Discover),
+        "search" => Some(ActiveView::Search),
         "favorites" | "favs" => Some(ActiveView::Favorites),
         "albums" => Some(ActiveView::Albums),
         "local" => Some(ActiveView::Local),
@@ -388,6 +396,25 @@ pub enum Message {
     SearchFocused(bool),
     SearchFocusResolved(bool),
     FocusSearchBox,
+    SetSearchPlatform(Platform),
+    SubmitSearch,
+    LoadMoreSearch,
+    RunSearchHistory(String),
+    ClearSearchHistory,
+    SearchCompleted(u64, usize, Result<Vec<TrackRecord>, String>),
+    FetchDiscoverFeed,
+    DiscoverFeedLoaded(Result<DiscoverFeed, String>),
+    OpenArtistDetail(String),
+    ArtistDetailLoaded(Result<ArtistDetail, String>),
+    OpenAlbumDetail(String, String),
+    AlbumDetailLoaded(Result<AlbumDetail, String>),
+    StreamResolved(u64, TrackRecord, bool, Result<ResolvedStream, String>),
+    SetAudioQuality(AudioQuality),
+    ProxyInputChanged(String),
+    SaveProxyUrl,
+    CheckForUpdates,
+    UpdateCheckFinished(Result<UpdateInfo, String>),
+    InstallUpdate,
 
     PlayTracks(Vec<TrackRecord>, usize),
     PlayPlaylist(String),
@@ -496,6 +523,23 @@ pub struct RaserApp {
 
     pub modal: Option<ModalState>,
     pub cache_stats: (u64, usize),
+
+    pub search_platform: Platform,
+    pub search_results: Vec<TrackRecord>,
+    pub search_loading: bool,
+    pub search_error: Option<String>,
+    pub search_offset: usize,
+    pub search_epoch: u64,
+    pub stream_resolve_epoch: u64,
+    pub discover_feed: DiscoverFeed,
+    pub discover_loading: bool,
+    pub artist_detail: Option<ArtistDetail>,
+    pub album_detail: Option<AlbumDetail>,
+    pub detail_loading: bool,
+    pub proxy_input: String,
+    pub update_checking: bool,
+    pub update_status: Option<String>,
+    pub update_info: Option<UpdateInfo>,
 }
 
 impl RaserApp {
@@ -528,6 +572,9 @@ impl RaserApp {
                 DEFAULT_SIDEBAR_ORDER.iter().map(|s| (*s).to_string()).collect();
         }
 
+        let search_platform = Platform::from_str_lossy(&snapshot.settings.platform);
+        let proxy_input = snapshot.settings.proxy_url.clone();
+
         let app = Self {
             audio,
             snapshot,
@@ -557,9 +604,30 @@ impl RaserApp {
             titlebar_hover_left_at: None,
             modal: None,
             cache_stats,
+            search_platform,
+            search_results: Vec::new(),
+            search_loading: false,
+            search_error: None,
+            search_offset: 0,
+            search_epoch: 0,
+            stream_resolve_epoch: 0,
+            discover_feed: DiscoverFeed::default(),
+            discover_loading: false,
+            artist_detail: None,
+            album_detail: None,
+            detail_loading: false,
+            proxy_input,
+            update_checking: false,
+            update_status: None,
+            update_info: None,
         };
 
         (app, window::oldest().map(Message::WindowOpened))
+    }
+
+    pub fn http_client(&self) -> Result<reqwest::Client, String> {
+        let proxy = self.snapshot.settings.proxy_url.trim();
+        providers::build_http_client(if proxy.is_empty() { None } else { Some(proxy) })
     }
 
     pub fn palette(&self) -> M3Palette {
@@ -655,9 +723,23 @@ impl RaserApp {
         self.snapshot.last_track = Some(entry);
     }
 
+    fn needs_stream_resolution(tr: &TrackRecord) -> bool {
+        let src = tr.playable_source();
+        let trimmed = src.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // YouTube / YouTube Music watch URLs and SoundCloud web URLs must be resolved to direct audio streams
+        lower.contains("youtube.com/watch")
+            || lower.contains("music.youtube.com/watch")
+            || lower.contains("youtu.be/")
+            || (lower.contains("soundcloud.com/") && !lower.contains("sndcdn.com"))
+    }
+
     fn load_track_task(&mut self, tr: &TrackRecord, record_history: bool) -> Task<Message> {
         let url = tr.playable_source();
-        if url.trim().is_empty() {
+        if url.trim().is_empty() && tr.title.trim().is_empty() {
             return Task::none();
         }
         if record_history {
@@ -666,6 +748,74 @@ impl RaserApp {
             self.snapshot.save();
         }
 
+        // If already cached on disk, skip remote stream resolution completely
+        let cached_hit = !tr.id.trim().is_empty() && storage::get_cached_audio_path(&tr.id).is_some();
+
+        if !cached_hit && Self::needs_stream_resolution(tr) {
+            self.load_epoch = self.load_epoch.wrapping_add(1);
+            self.stream_resolve_epoch = self.stream_resolve_epoch.wrapping_add(1);
+            let resolve_epoch = self.stream_resolve_epoch;
+            self.seek_coordinator.begin_load();
+            self.last_ended_reported = false;
+            self.audio_state.loading = true;
+            self.audio_state.playing = false;
+            self.audio_state.error = None;
+
+            let client = match self.http_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    self.audio_state.loading = false;
+                    self.audio_state.error = Some(e);
+                    return Task::none();
+                }
+            };
+            let track_clone = tr.clone();
+            let track_for_msg = tr.clone();
+            let quality = AudioQuality::from_str_lossy(&self.snapshot.settings.audio_quality);
+
+            return Task::perform(
+                async move {
+                    let mut resolved = providers::resolve_stream_url(&client, &track_clone, quality).await?;
+                    if resolved.is_hls || resolved.stream_url.contains(".m3u8") {
+                        // Concatenate HLS .m3u8 segments into audio cache file so AudioCore can play & seek cleanly
+                        if let Ok(m3u8_res) = client.get(&resolved.stream_url).send().await {
+                            if let Ok(body) = m3u8_res.text().await {
+                                let segs = providers::soundcloud::parse_m3u8_segments(&body, &resolved.stream_url);
+                                if !segs.is_empty() {
+                                    let mut buf = Vec::new();
+                                    for seg_url in segs {
+                                        if let Ok(s_res) = client.get(&seg_url).send().await {
+                                            if let Ok(bytes) = s_res.bytes().await {
+                                                buf.extend_from_slice(&bytes);
+                                            }
+                                        }
+                                    }
+                                    if !buf.is_empty() {
+                                        let key = if track_clone.id.is_empty() {
+                                            format!("sc_hls_{}", now_millis())
+                                        } else {
+                                            track_clone.id.clone()
+                                        };
+                                        storage::save_cached_audio(&key, &buf);
+                                        if let Some(cached_path) = storage::get_cached_audio_path(&key) {
+                                            resolved.stream_url = cached_path.to_string_lossy().to_string();
+                                            resolved.is_hls = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(resolved)
+                },
+                move |res| Message::StreamResolved(resolve_epoch, track_for_msg, record_history, res),
+            );
+        }
+
+        self.start_audio_load_with_url(tr, url)
+    }
+
+    fn start_audio_load_with_url(&mut self, tr: &TrackRecord, url: String) -> Task<Message> {
         self.load_epoch = self.load_epoch.wrapping_add(1);
         let my_load_epoch = self.load_epoch;
         self.seek_coordinator.begin_load();
@@ -862,7 +1012,12 @@ impl RaserApp {
                     Task::none()
                 } else if self.search_focused {
                     self.unfocus_search()
-                } else if matches!(self.active_view, ActiveView::PlaylistDetail(_)) {
+                } else if matches!(
+                    self.active_view,
+                    ActiveView::PlaylistDetail(_)
+                        | ActiveView::ArtistDetail(_)
+                        | ActiveView::AlbumDetail { .. }
+                ) {
                     self.navigate_back();
                     Task::none()
                 } else {
@@ -877,7 +1032,7 @@ impl RaserApp {
             Message::Noop => Task::none(),
             Message::WindowOpened(id) => {
                 self.main_window_id = id;
-                Task::none()
+                self.update(Message::FetchDiscoverFeed)
             }
             Message::DragWindow => {
                 if let Some(id) = self.main_window_id {
@@ -983,6 +1138,265 @@ impl RaserApp {
                     operation::is_focused(views::search_input_id())
                         .map(Message::SearchFocusResolved),
                 )
+            }
+            Message::SetSearchPlatform(plat) => {
+                self.search_platform = plat;
+                self.snapshot.settings.platform = plat.as_str().to_string();
+                self.snapshot.save();
+                if !self.search_query.trim().is_empty() {
+                    return self.update(Message::SubmitSearch);
+                }
+                Task::none()
+            }
+            Message::SubmitSearch => {
+                let q = self.search_query.trim().to_string();
+                if q.is_empty() {
+                    return Task::none();
+                }
+                self.snapshot.settings.search_history.retain(|h| !h.eq_ignore_ascii_case(&q));
+                self.snapshot.settings.search_history.insert(0, q.clone());
+                self.snapshot.settings.search_history.truncate(12);
+                self.snapshot.save();
+
+                self.search_epoch = self.search_epoch.wrapping_add(1);
+                let my_epoch = self.search_epoch;
+                self.search_loading = true;
+                self.search_error = None;
+                self.search_offset = 0;
+                self.search_results.clear();
+                let switch_task = self.switch_view(ActiveView::Search);
+
+                let plat = self.search_platform;
+                let client = match self.http_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.search_loading = false;
+                        self.search_error = Some(e);
+                        return switch_task;
+                    }
+                };
+                let search_task = Task::perform(
+                    async move {
+                        let items = providers::search_tracks(&client, &q, plat, 15, 0).await?;
+                        Ok(items.into_iter().map(TrackRecord::from).collect())
+                    },
+                    move |res| Message::SearchCompleted(my_epoch, 0, res),
+                );
+                Task::batch([switch_task, search_task])
+            }
+            Message::LoadMoreSearch => {
+                let q = self.search_query.trim().to_string();
+                if q.is_empty() || self.search_loading {
+                    return Task::none();
+                }
+                let next_offset = self.search_offset + 15;
+                self.search_epoch = self.search_epoch.wrapping_add(1);
+                let my_epoch = self.search_epoch;
+                self.search_loading = true;
+                let plat = self.search_platform;
+                let client = match self.http_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.search_loading = false;
+                        self.search_error = Some(e);
+                        return Task::none();
+                    }
+                };
+                Task::perform(
+                    async move {
+                        let items =
+                            providers::search_tracks(&client, &q, plat, 15, next_offset).await?;
+                        Ok(items.into_iter().map(TrackRecord::from).collect())
+                    },
+                    move |res| Message::SearchCompleted(my_epoch, next_offset, res),
+                )
+            }
+            Message::RunSearchHistory(q) => {
+                self.search_query = q;
+                self.update(Message::SubmitSearch)
+            }
+            Message::ClearSearchHistory => {
+                self.snapshot.settings.search_history.clear();
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::SearchCompleted(epoch, offset, res) => {
+                if epoch != self.search_epoch {
+                    return Task::none();
+                }
+                self.search_loading = false;
+                match res {
+                    Ok(items) => {
+                        if offset == 0 {
+                            self.search_results = items;
+                        } else {
+                            for tr in items {
+                                if !self.search_results.iter().any(|e| e.matches(&tr)) {
+                                    self.search_results.push(tr);
+                                }
+                            }
+                        }
+                        self.search_offset = offset;
+                        self.search_error = None;
+                    }
+                    Err(e) => {
+                        self.search_error = Some(e);
+                    }
+                }
+                Task::none()
+            }
+            Message::FetchDiscoverFeed => {
+                if self.discover_loading {
+                    return Task::none();
+                }
+                let Ok(client) = self.http_client() else {
+                    return Task::none();
+                };
+                self.discover_loading = true;
+                let hist = self.snapshot.history.clone();
+                Task::perform(
+                    async move { providers::youtube::fetch_discover_feed(&client, &hist).await },
+                    Message::DiscoverFeedLoaded,
+                )
+            }
+            Message::DiscoverFeedLoaded(res) => {
+                self.discover_loading = false;
+                if let Ok(feed) = res {
+                    self.discover_feed = feed;
+                }
+                Task::none()
+            }
+            Message::OpenArtistDetail(name) => {
+                let clean = name.trim().to_string();
+                if clean.is_empty() {
+                    return Task::none();
+                }
+                self.detail_loading = true;
+                self.artist_detail = None;
+                let sw = self.switch_view(ActiveView::ArtistDetail(clean.clone()));
+                let Ok(client) = self.http_client() else {
+                    self.detail_loading = false;
+                    return sw;
+                };
+                let fetch = Task::perform(
+                    async move { providers::youtube::fetch_artist_detail(&client, &clean).await },
+                    Message::ArtistDetailLoaded,
+                );
+                Task::batch([sw, fetch])
+            }
+            Message::ArtistDetailLoaded(res) => {
+                self.detail_loading = false;
+                if let Ok(detail) = res {
+                    self.artist_detail = Some(detail);
+                }
+                Task::none()
+            }
+            Message::OpenAlbumDetail(title, artist) => {
+                let clean_t = title.trim().to_string();
+                let clean_a = artist.trim().to_string();
+                if clean_t.is_empty() {
+                    return Task::none();
+                }
+                self.detail_loading = true;
+                self.album_detail = None;
+                let sw = self.switch_view(ActiveView::AlbumDetail {
+                    title: clean_t.clone(),
+                    artist: clean_a.clone(),
+                });
+                let Ok(client) = self.http_client() else {
+                    self.detail_loading = false;
+                    return sw;
+                };
+                let fetch = Task::perform(
+                    async move {
+                        providers::youtube::fetch_album_detail(&client, &clean_t, &clean_a).await
+                    },
+                    Message::AlbumDetailLoaded,
+                );
+                Task::batch([sw, fetch])
+            }
+            Message::AlbumDetailLoaded(res) => {
+                self.detail_loading = false;
+                if let Ok(detail) = res {
+                    self.album_detail = Some(detail);
+                }
+                Task::none()
+            }
+            Message::StreamResolved(resolve_epoch, mut tr, _record_history, res) => {
+                if resolve_epoch != self.stream_resolve_epoch {
+                    return Task::none();
+                }
+                match res {
+                    Ok(stream) => {
+                        if tr.duration <= 0.0 {
+                            if let Some(dur) = stream.duration_secs {
+                                tr.duration = dur;
+                            }
+                        }
+                        self.start_audio_load_with_url(&tr, stream.stream_url)
+                    }
+                    Err(e) => {
+                        let _ = self.seek_coordinator.finish_load(0.0);
+                        self.audio_state.loading = false;
+                        self.audio_state.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::SetAudioQuality(q) => {
+                self.snapshot.settings.audio_quality = q.as_str().to_string();
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::ProxyInputChanged(val) => {
+                self.proxy_input = val;
+                Task::none()
+            }
+            Message::SaveProxyUrl => {
+                self.snapshot.settings.proxy_url = self.proxy_input.trim().to_string();
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::CheckForUpdates => {
+                if self.update_checking {
+                    return Task::none();
+                }
+                self.update_checking = true;
+                self.update_status = None;
+                Task::perform(updater::check_for_update(), Message::UpdateCheckFinished)
+            }
+            Message::UpdateCheckFinished(res) => {
+                self.update_checking = false;
+                match res {
+                    Ok(info) => {
+                        if info.should_update {
+                            self.update_status = Some(format!(
+                                "v{} -> v{}",
+                                info.current_version, info.latest_version
+                            ));
+                            self.update_info = Some(info);
+                        } else {
+                            self.update_status = Some("up_to_date".to_string());
+                            self.update_info = None;
+                        }
+                    }
+                    Err(e) => {
+                        self.update_status = Some(e);
+                    }
+                }
+                Task::none()
+            }
+            Message::InstallUpdate => {
+                if let Some(info) = self.update_info.clone() {
+                    return Task::perform(
+                        async move {
+                            let _ = updater::download_and_install_update(info.download_url, None)
+                                .await;
+                        },
+                        |_| Message::Noop,
+                    );
+                }
+                Task::none()
             }
             Message::PlayTracks(tracks, idx) => {
                 if tracks.is_empty() {
