@@ -386,6 +386,7 @@ pub enum Message {
     NavigateBack,
     SearchQueryChanged(String),
     SearchFocused(bool),
+    SearchFocusResolved(bool),
     FocusSearchBox,
 
     PlayTracks(Vec<TrackRecord>, usize),
@@ -472,6 +473,7 @@ pub struct RaserApp {
     pub queue_panel_tab: QueuePanelTab,
     pub search_query: String,
     pub search_focused: bool,
+    pub focus_search_pending: bool,
 
     pub queue: Vec<TrackRecord>,
     pub queue_index: Option<usize>,
@@ -536,6 +538,7 @@ impl RaserApp {
             queue_panel_tab: QueuePanelTab::Queue,
             search_query: String::new(),
             search_focused: false,
+            focus_search_pending: false,
             queue,
             queue_index,
             play_history: Vec::new(),
@@ -808,6 +811,7 @@ impl RaserApp {
     }
 
     fn unfocus_search(&mut self) -> Task<Message> {
+        self.focus_search_pending = false;
         if self.search_focused {
             self.search_focused = false;
             operation::focus(iced::widget::Id::new("raser-unfocus-sentinel"))
@@ -851,10 +855,7 @@ impl RaserApp {
             ShortcutAction::CycleRepeat => self.update(Message::CycleRepeat),
             ShortcutAction::ToggleMiniPlayer => self.update(Message::ToggleMiniPlayer),
             ShortcutAction::ToggleFullscreen => self.update(Message::ToggleFullscreen),
-            ShortcutAction::FocusSearch => {
-                self.search_focused = true;
-                operation::focus(views::search_input_id())
-            }
+            ShortcutAction::FocusSearch => self.update(Message::FocusSearchBox),
             ShortcutAction::EscapeUnwind => {
                 if self.modal.is_some() {
                     self.modal = None;
@@ -963,12 +964,25 @@ impl RaserApp {
                 Task::none()
             }
             Message::SearchFocused(f) => {
-                self.search_focused = f;
+                if !self.focus_search_pending || f {
+                    self.search_focused = f;
+                }
+                Task::none()
+            }
+            Message::SearchFocusResolved(f) => {
+                if self.focus_search_pending {
+                    self.focus_search_pending = false;
+                    self.search_focused = f;
+                }
                 Task::none()
             }
             Message::FocusSearchBox => {
                 self.search_focused = true;
-                operation::focus(views::search_input_id())
+                self.focus_search_pending = true;
+                operation::focus(views::search_input_id()).chain(
+                    operation::is_focused(views::search_input_id())
+                        .map(Message::SearchFocusResolved),
+                )
             }
             Message::PlayTracks(tracks, idx) => {
                 if tracks.is_empty() {
@@ -1727,7 +1741,7 @@ impl RaserApp {
                     if btn == mouse::Button::Back || btn == mouse::Button::Other(3) {
                         self.navigate_back();
                     }
-                    if self.modal.is_none() {
+                    if self.modal.is_none() && !self.focus_search_pending {
                         operation::is_focused(views::search_input_id()).map(Message::SearchFocused)
                     } else {
                         Task::none()
