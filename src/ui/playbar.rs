@@ -1,6 +1,7 @@
-use crate::app::{format_mm_ss, Message, RaserApp};
+use crate::app::{format_mm_ss, ActiveView, Message, RaserApp};
 use crate::i18n::t;
 use crate::storage::RepeatMode;
+use crate::ui::visualizer;
 use crate::ui::{
     icon_pill_btn, icon_svg, m3_slider_style, pill_primary_btn, surface_container_style,
     transparent_icon_btn, with_alpha, M3Palette, CORNER_M, CORNER_XL, ICON_EDIT, ICON_HEART,
@@ -11,8 +12,8 @@ use crate::ui::{
 use iced::alignment::Vertical;
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas, Geometry, Path, Stroke};
-use iced::widget::{button, column, container, row, slider, text, tooltip};
-use iced::{Alignment, Background, Border, Element, Length, Padding, Point, Rectangle, Renderer, Size, Theme};
+use iced::widget::{button, column, container, image as iced_image, row, slider, text, tooltip};
+use iced::{Alignment, Background, Border, ContentFit, Element, Length, Padding, Point, Rectangle, Renderer, Size, Theme};
 
 #[derive(Debug, Default)]
 pub struct ScrubberState {
@@ -255,9 +256,19 @@ pub fn view_playbar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
         .unwrap_or(false);
 
     // Artwork box (72x72 rounded 12px per ui/styles.css:3043)
-    let artwork = container(icon_svg(ICON_MUSIC, p.outline, 22.0))
+    let artwork_inner: Element<'a, Message> = if let Some(handle) = app.current_cover_handle() {
+        iced_image::Image::new(handle)
+            .width(72)
+            .height(72)
+            .content_fit(ContentFit::Cover)
+            .into()
+    } else {
+        icon_svg(ICON_MUSIC, p.outline, 22.0)
+    };
+    let artwork = container(artwork_inner)
         .width(72)
         .height(72)
+        .clip(true)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_| surface_container_style(p.surface_container_highest, CORNER_M));
@@ -637,9 +648,38 @@ pub fn view_playbar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
         .color(p.outline)
         .width(Length::Fixed(34.0));
 
+    let vis_active = matches!(app.active_view, ActiveView::Visualizer);
+    let vis_btn = tooltip(
+        button(
+            container(visualizer::view_visualizer_canvas(
+                &app.fft_bins,
+                p,
+                is_playing,
+                16,
+                26.0,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+        )
+        .width(72)
+        .height(34)
+        .padding(4)
+        .style(move |_, status| icon_pill_btn(p, vis_active, status))
+        .on_press(Message::SwitchView(if vis_active {
+            ActiveView::Discover
+        } else {
+            ActiveView::Visualizer
+        })),
+        text(t(app.lang, "visualizer")).size(11).color(p.on_surface),
+        tooltip::Position::Top,
+    )
+    .style(move |_| surface_container_style(p.surface_container_high, 8.0));
+
     let right_panel = container(
-        row![queue_btn, speed_btn, mute_btn, vol_slider, vol_pct]
-            .spacing(10)
+        row![vis_btn, queue_btn, speed_btn, mute_btn, vol_slider, vol_pct]
+            .spacing(8)
             .align_y(Vertical::Center),
     )
     .width(Length::FillPortion(1))
@@ -701,9 +741,19 @@ pub fn view_mini_player<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mess
         .map(|tr| app.display_artist(tr))
         .unwrap_or_else(|| t(app.lang, "select_track").to_string());
 
-    let cover = container(icon_svg(ICON_MUSIC, p.primary, 52.0))
+    let cover_inner: Element<'a, Message> = if let Some(handle) = app.current_cover_handle() {
+        iced_image::Image::new(handle)
+            .width(180)
+            .height(180)
+            .content_fit(ContentFit::Cover)
+            .into()
+    } else {
+        icon_svg(ICON_MUSIC, p.primary, 52.0)
+    };
+    let cover = container(cover_inner)
         .width(180)
         .height(180)
+        .clip(true)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_| surface_container_style(p.surface_container_highest, CORNER_XL));

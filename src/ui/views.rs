@@ -5,6 +5,8 @@ use crate::app::{
 use crate::i18n::t;
 use crate::providers::{AudioQuality, Platform};
 use crate::storage::{TrackRecord, TrackSortMode};
+use crate::theme::PaletteStyle;
+use crate::ui::visualizer;
 use crate::ui::{
     icon_pill_btn, icon_svg, m3_slider_style, modal_card_style, modal_input_style,
     outline_pill_btn, pill_primary_btn, search_input_style, surface_card_bordered,
@@ -15,9 +17,10 @@ use crate::ui::{
 };
 use iced::alignment::Vertical;
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, slider, text, text_input, tooltip, Id,
+    button, column, container, image as iced_image, mouse_area, row, scrollable, slider, stack,
+    text, text_input, tooltip, Id,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding};
 
 pub fn search_input_id() -> Id {
     Id::new("raser-main-search-input")
@@ -136,6 +139,7 @@ pub fn view_main_content<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mes
     let body: Element<'a, Message> = match &app.active_view {
         ActiveView::Discover => view_discover(app, p),
         ActiveView::Search => view_search(app, p),
+        ActiveView::Visualizer => view_visualizer(app, p),
         ActiveView::Favorites => view_favorites(app, p),
         ActiveView::Albums => view_albums(app, p),
         ActiveView::Local => view_local(app, p),
@@ -922,6 +926,95 @@ fn view_album_detail<'a>(
         .into()
 }
 
+fn view_visualizer<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
+    let cur = app.current_track();
+    let title = cur
+        .as_ref()
+        .map(|tr| app.display_title(tr))
+        .unwrap_or_else(|| t(app.lang, "no_track_playing").to_string());
+    let artist = cur
+        .as_ref()
+        .map(|tr| app.display_artist(tr))
+        .unwrap_or_else(|| t(app.lang, "select_track").to_string());
+
+    let morph_bg = visualizer::view_m3_cover_backdrop(
+        p,
+        app.m3_shape_index,
+        app.m3_morph_progress,
+        240.0,
+    );
+    let inner_cover: Element<'a, Message> = if let Some(handle) = app.current_cover_handle() {
+        container(
+            iced_image::Image::new(handle)
+                .width(156)
+                .height(156)
+                .content_fit(ContentFit::Cover),
+        )
+        .width(156)
+        .height(156)
+        .clip(true)
+        .style(move |_| surface_container_style(p.surface_container_high, CORNER_XL))
+        .into()
+    } else {
+        icon_svg(ICON_MUSIC, p.primary, 64.0)
+    };
+
+    let hero_cover = container(
+        stack![
+            morph_bg,
+            container(inner_cover)
+                .width(240)
+                .height(240)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center),
+        ]
+        .width(240)
+        .height(240),
+    )
+    .width(240)
+    .height(240);
+
+    let spec = container(visualizer::view_visualizer_canvas(
+        &app.fft_bins,
+        p,
+        app.audio_state.playing,
+        64,
+        180.0,
+    ))
+    .width(Length::Fill)
+    .padding([16, 20])
+    .style(move |_| surface_container_style(p.surface_container, CORNER_XL));
+
+    column![
+        row![
+            text(t(app.lang, "visualizer")).size(22).color(p.on_surface),
+            container(text("").size(1)).width(Length::Fill),
+            button(text(t(app.lang, "back")).size(12))
+                .height(34)
+                .padding([0, 14])
+                .style(move |_, status| outline_pill_btn(p, false, status))
+                .on_press(Message::NavigateBack),
+        ]
+        .align_y(Vertical::Center),
+        container(
+            column![
+                hero_cover,
+                text(title).size(24).color(p.on_surface),
+                text(artist).size(14).color(p.on_surface_variant),
+            ]
+            .spacing(10)
+            .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([28, 24])
+        .align_x(Alignment::Center)
+        .style(move |_| surface_container_style(p.surface_container_low, CORNER_XL)),
+        spec,
+    ]
+    .spacing(18)
+    .into()
+}
+
 fn sort_label(app: &RaserApp, mode: TrackSortMode) -> &'static str {
     match mode {
         TrackSortMode::Manual => t(app.lang, "sort_manual"),
@@ -1353,7 +1446,9 @@ fn view_settings<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
     let nav = container(
         column![
             tab_btn(SettingsTab::Interface, "interface"),
+            tab_btn(SettingsTab::Themes, "themes"),
             tab_btn(SettingsTab::Playback, "playback"),
+            tab_btn(SettingsTab::Integrations, "integrations"),
             tab_btn(SettingsTab::Storage, "storage"),
             tab_btn(SettingsTab::About, "about"),
         ]
@@ -1546,6 +1641,147 @@ fn view_settings<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
             ]
             .spacing(10)
             .into()
+        }
+        SettingsTab::Themes => {
+            let dyn_card = setting_card(
+                row![
+                    column![
+                        text(t(app.lang, "dynamic_theme")).size(14).color(p.on_surface),
+                        text(t(app.lang, "dynamic_theme_desc"))
+                            .size(12)
+                            .color(p.outline),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    m3_switch(
+                        p,
+                        app.snapshot.settings.dynamic_theme,
+                        Message::ToggleDynamicTheme,
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Vertical::Center)
+                .into(),
+            );
+
+            let cur_mode = app.snapshot.settings.theme_mode.to_ascii_lowercase();
+            let is_auto = cur_mode == "auto";
+            let is_dark_m = cur_mode == "dark";
+            let is_light_m = cur_mode == "light";
+            let mode_card = setting_card(
+                row![
+                    text(t(app.lang, "theme_mode")).size(14).color(p.on_surface),
+                    container(text("").size(1)).width(Length::Fill),
+                    button(text(t(app.lang, "auto")).size(12))
+                        .height(32)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, is_auto, status))
+                        .on_press(Message::SetThemeMode("auto".to_string())),
+                    button(text(t(app.lang, "dark")).size(12))
+                        .height(32)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, is_dark_m, status))
+                        .on_press(Message::SetThemeMode("dark".to_string())),
+                    button(text(t(app.lang, "light")).size(12))
+                        .height(32)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, is_light_m, status))
+                        .on_press(Message::SetThemeMode("light".to_string())),
+                ]
+                .spacing(6)
+                .align_y(Vertical::Center)
+                .into(),
+            );
+
+            let cur_style = PaletteStyle::from_str_lossy(&app.snapshot.settings.palette_style);
+            let mut style_row = row![
+                text(t(app.lang, "palette_style")).size(14).color(p.on_surface),
+                container(text("").size(1)).width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center);
+            for st in [
+                PaletteStyle::Classic,
+                PaletteStyle::TonalSpot,
+                PaletteStyle::Expressive,
+                PaletteStyle::Vibrant,
+                PaletteStyle::Neutral,
+            ] {
+                let active = cur_style == st;
+                style_row = style_row.push(
+                    button(text(st.label()).size(12))
+                        .height(32)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, active, status))
+                        .on_press(Message::SetPaletteStyle(st)),
+                );
+            }
+            let style_card = setting_card(style_row.into());
+
+            let reset_card = setting_card(
+                row![
+                    text(t(app.lang, "reset_theme")).size(13).color(p.on_surface_variant),
+                    container(text("").size(1)).width(Length::Fill),
+                    button(text(t(app.lang, "reset")).size(12))
+                        .height(34)
+                        .padding([0, 16])
+                        .style(move |_, status| outline_pill_btn(p, false, status))
+                        .on_press(Message::ResetThemeEmergency),
+                ]
+                .align_y(Vertical::Center)
+                .into(),
+            );
+
+            column![dyn_card, mode_card, style_card, reset_card]
+                .spacing(10)
+                .into()
+        }
+        SettingsTab::Integrations => {
+            let discord_card = setting_card(
+                row![
+                    column![
+                        text(t(app.lang, "discord_rpc")).size(14).color(p.on_surface),
+                        text(t(app.lang, "discord_rpc_desc"))
+                            .size(12)
+                            .color(p.outline),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    m3_switch(
+                        p,
+                        app.snapshot.settings.discord_rpc,
+                        Message::ToggleDiscordRpc,
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Vertical::Center)
+                .into(),
+            );
+
+            let tray_card = setting_card(
+                row![
+                    column![
+                        text(t(app.lang, "minimize_to_tray"))
+                            .size(14)
+                            .color(p.on_surface),
+                        text(t(app.lang, "minimize_to_tray_desc"))
+                            .size(12)
+                            .color(p.outline),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    m3_switch(
+                        p,
+                        app.snapshot.settings.minimize_to_tray,
+                        Message::ToggleMinimizeToTray,
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Vertical::Center)
+                .into(),
+            );
+
+            column![discord_card, tray_card].spacing(10).into()
         }
         SettingsTab::Playback => {
             let autoplay_card = setting_card(
