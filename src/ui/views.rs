@@ -3,6 +3,7 @@ use crate::app::{
     QueuePanelTab, RaserApp, SettingsTab,
 };
 use crate::i18n::t;
+use crate::providers::{AudioQuality, Platform};
 use crate::storage::{TrackRecord, TrackSortMode};
 use crate::ui::{
     icon_pill_btn, icon_svg, m3_slider_style, modal_card_style, modal_input_style,
@@ -30,6 +31,7 @@ pub fn view_top_nav<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
                 text_input(t(app.lang, "search_placeholder"), &app.search_query)
                     .id(search_input_id())
                     .on_input(Message::SearchQueryChanged)
+                    .on_submit(Message::SubmitSearch)
                     .size(15)
                     .padding([10, 8])
                     .style(move |_, status| search_input_style(p, status)),
@@ -46,7 +48,7 @@ pub fn view_top_nav<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
     )
     .on_press(Message::FocusSearchBox);
 
-    let mut search_row = row![search_bar].align_y(Vertical::Center);
+    let mut search_row = row![search_bar].spacing(8).align_y(Vertical::Center);
     if !app.search_query.is_empty() {
         search_row = search_row.push(
             button(
@@ -61,6 +63,23 @@ pub fn view_top_nav<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
             .padding(0)
             .style(move |_, status| transparent_icon_btn(p, false, status))
             .on_press(Message::SearchQueryChanged(String::new())),
+        );
+    }
+    search_row = search_row.push(
+        button(text(t(app.lang, "search")).size(12))
+            .height(36)
+            .padding([0, 14])
+            .style(move |_, status| pill_primary_btn(p, status))
+            .on_press(Message::SubmitSearch),
+    );
+    for plat in [Platform::YouTubeMusic, Platform::YouTube, Platform::SoundCloud] {
+        let active = app.search_platform == plat;
+        search_row = search_row.push(
+            button(text(plat.label()).size(11))
+                .height(32)
+                .padding([0, 10])
+                .style(move |_, status| outline_pill_btn(p, active, status))
+                .on_press(Message::SetSearchPlatform(plat)),
         );
     }
 
@@ -116,12 +135,15 @@ pub fn view_main_content<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mes
     let classic = app.snapshot.settings.advanced.classic_sidebar;
     let body: Element<'a, Message> = match &app.active_view {
         ActiveView::Discover => view_discover(app, p),
+        ActiveView::Search => view_search(app, p),
         ActiveView::Favorites => view_favorites(app, p),
         ActiveView::Albums => view_albums(app, p),
         ActiveView::Local => view_local(app, p),
         ActiveView::History => view_history(app, p),
         ActiveView::Queue => view_queue(app, p),
         ActiveView::PlaylistDetail(id) => view_playlist_detail(app, p, id),
+        ActiveView::ArtistDetail(name) => view_artist_detail(app, p, name),
+        ActiveView::AlbumDetail { title, artist } => view_album_detail(app, p, title, artist),
         ActiveView::Settings => view_settings(app, p),
     };
 
@@ -637,6 +659,57 @@ fn view_discover<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
     ]
     .spacing(20);
 
+    if !app.discover_feed.trending.is_empty() {
+        let trend_tracks: Vec<TrackRecord> = app
+            .discover_feed
+            .trending
+            .iter()
+            .take(10)
+            .cloned()
+            .map(TrackRecord::from)
+            .collect();
+        content = content
+            .push(
+                row![
+                    text(t(app.lang, "trending")).size(16).color(p.on_surface),
+                    container(text("").size(1)).width(Length::Fill),
+                    button(text(t(app.lang, "refresh")).size(12))
+                        .height(30)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, false, status))
+                        .on_press(Message::FetchDiscoverFeed),
+                ]
+                .align_y(Vertical::Center),
+            )
+            .push(view_track_list(
+                app,
+                p,
+                &trend_tracks,
+                TrackContext::Library,
+                None,
+            ));
+    }
+
+    if !app.discover_feed.quick_picks.is_empty() {
+        let picks: Vec<TrackRecord> = app
+            .discover_feed
+            .quick_picks
+            .iter()
+            .take(8)
+            .cloned()
+            .map(TrackRecord::from)
+            .collect();
+        content = content
+            .push(text(t(app.lang, "quick_picks")).size(16).color(p.on_surface))
+            .push(view_track_list(
+                app,
+                p,
+                &picks,
+                TrackContext::Library,
+                None,
+            ));
+    }
+
     if !app.snapshot.history.is_empty() {
         let recent_slice: Vec<TrackRecord> =
             app.snapshot.history.iter().take(6).cloned().collect();
@@ -652,6 +725,201 @@ fn view_discover<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
     }
 
     content.into()
+}
+
+fn view_search<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
+    let mut header = row![
+        column![
+            text(t(app.lang, "search_results")).size(22).color(p.on_surface),
+            text(if app.search_loading {
+                t(app.lang, "searching").to_string()
+            } else {
+                format!("{} {}", app.search_results.len(), t(app.lang, "tracks"))
+            })
+            .size(12)
+            .color(p.outline),
+        ]
+        .spacing(2),
+        container(text("").size(1)).width(Length::Fill),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    for plat in [Platform::YouTubeMusic, Platform::YouTube, Platform::SoundCloud] {
+        let active = app.search_platform == plat;
+        header = header.push(
+            button(text(plat.label()).size(12))
+                .height(34)
+                .padding([0, 14])
+                .style(move |_, status| outline_pill_btn(p, active, status))
+                .on_press(Message::SetSearchPlatform(plat)),
+        );
+    }
+
+    let mut content = column![header].spacing(16);
+
+    if !app.snapshot.settings.search_history.is_empty() {
+        let mut hist_row = row![
+            text(t(app.lang, "search_history"))
+                .size(12)
+                .color(p.on_surface_variant),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center);
+        for q in app.snapshot.settings.search_history.iter().take(6) {
+            hist_row = hist_row.push(
+                button(text(q).size(11))
+                    .height(28)
+                    .padding([0, 10])
+                    .style(move |_, status| outline_pill_btn(p, false, status))
+                    .on_press(Message::RunSearchHistory(q.clone())),
+            );
+        }
+        hist_row = hist_row.push(
+            button(text(t(app.lang, "clear_search_history")).size(11))
+                .height(28)
+                .padding([0, 10])
+                .style(move |_, status| transparent_icon_btn(p, false, status))
+                .on_press(Message::ClearSearchHistory),
+        );
+        content = content.push(hist_row);
+    }
+
+    if let Some(ref err) = app.search_error {
+        content = content.push(
+            container(text(err).size(13).color(p.error))
+                .padding([12, 16])
+                .style(move |_| surface_container_style(p.surface_container, CORNER_M)),
+        );
+    }
+
+    if app.search_results.is_empty() && !app.search_loading {
+        content = content.push(view_empty_state(
+            p,
+            ICON_SEARCH,
+            t(app.lang, "empty_search_title"),
+            t(app.lang, "empty_search_sub"),
+        ));
+    } else if !app.search_results.is_empty() {
+        content = content.push(view_track_list(
+            app,
+            p,
+            &app.search_results,
+            TrackContext::Library,
+            None,
+        ));
+        if !app.search_loading {
+            content = content.push(
+                button(text(t(app.lang, "load_more")).size(13))
+                    .height(38)
+                    .padding([0, 20])
+                    .style(move |_, status| outline_pill_btn(p, false, status))
+                    .on_press(Message::LoadMoreSearch),
+            );
+        }
+    }
+
+    content.into()
+}
+
+fn view_artist_detail<'a>(app: &'a RaserApp, p: M3Palette, name: &'a str) -> Element<'a, Message> {
+    let back_btn = button(
+        container(icon_svg(ICON_BACK, p.on_surface_variant, 18.0))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+    )
+    .width(40)
+    .height(40)
+    .padding(0)
+    .style(move |_, status| icon_pill_btn(p, false, status))
+    .on_press(Message::NavigateBack);
+
+    let tracks: Vec<TrackRecord> = app
+        .artist_detail
+        .as_ref()
+        .map(|d| d.top_tracks.iter().cloned().map(TrackRecord::from).collect())
+        .unwrap_or_default();
+
+    let header_card = container(
+        column![
+            text(name).size(28).color(p.on_surface),
+            text(if app.detail_loading {
+                t(app.lang, "searching").to_string()
+            } else {
+                format!(
+                    "{}: {} {}",
+                    t(app.lang, "artist_top_tracks"),
+                    tracks.len(),
+                    t(app.lang, "tracks")
+                )
+            })
+            .size(13)
+            .color(p.on_surface_variant),
+        ]
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .padding(24)
+    .style(move |_| surface_container_style(p.surface_container, CORNER_XL));
+
+    let list_elem = if tracks.is_empty() {
+        view_empty_state(p, ICON_MUSIC, name, t(app.lang, "searching"))
+    } else {
+        view_track_list(app, p, &tracks, TrackContext::Library, None)
+    };
+
+    column![back_btn, header_card, list_elem]
+        .spacing(16)
+        .into()
+}
+
+fn view_album_detail<'a>(
+    app: &'a RaserApp,
+    p: M3Palette,
+    title: &'a str,
+    artist: &'a str,
+) -> Element<'a, Message> {
+    let back_btn = button(
+        container(icon_svg(ICON_BACK, p.on_surface_variant, 18.0))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+    )
+    .width(40)
+    .height(40)
+    .padding(0)
+    .style(move |_, status| icon_pill_btn(p, false, status))
+    .on_press(Message::NavigateBack);
+
+    let tracks: Vec<TrackRecord> = app
+        .album_detail
+        .as_ref()
+        .map(|d| d.tracks.iter().cloned().map(TrackRecord::from).collect())
+        .unwrap_or_default();
+
+    let header_card = container(
+        column![
+            text(title).size(26).color(p.on_surface),
+            text(artist).size(14).color(p.on_surface_variant),
+        ]
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .padding(24)
+    .style(move |_| surface_container_style(p.surface_container, CORNER_XL));
+
+    let list_elem = if tracks.is_empty() {
+        view_empty_state(p, ICON_ALBUMS, title, artist)
+    } else {
+        view_track_list(app, p, &tracks, TrackContext::Library, None)
+    };
+
+    column![back_btn, header_card, list_elem]
+        .spacing(16)
+        .into()
 }
 
 fn sort_label(app: &RaserApp, mode: TrackSortMode) -> &'static str {
@@ -743,8 +1011,10 @@ fn view_albums<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
         } else {
             album.artist.as_str()
         };
+        let title_owned = title.to_string();
+        let artist_owned = artist.to_string();
         cards = cards.push(
-            container(
+            button(
                 column![
                     container(icon_svg(ICON_ALBUMS, p.primary, 40.0))
                         .width(140)
@@ -757,7 +1027,10 @@ fn view_albums<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
                 ]
                 .spacing(6),
             )
-            .width(140),
+            .width(156)
+            .padding(8)
+            .style(move |_, status| track_row_btn(p, false, status))
+            .on_press(Message::OpenAlbumDetail(title_owned, artist_owned)),
         );
     }
 
@@ -1333,7 +1606,32 @@ fn view_settings<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
                 .into(),
             );
 
-            column![autoplay_card, speed_card, vol_card]
+            let qualities = [
+                AudioQuality::Low,
+                AudioQuality::Medium,
+                AudioQuality::High,
+                AudioQuality::Max,
+            ];
+            let cur_q = AudioQuality::from_str_lossy(&app.snapshot.settings.audio_quality);
+            let mut q_row = row![
+                text(t(app.lang, "audio_quality")).size(14).color(p.on_surface),
+                container(text("").size(1)).width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center);
+            for q in qualities {
+                let active = cur_q == q;
+                q_row = q_row.push(
+                    button(text(q.as_str()).size(12))
+                        .height(32)
+                        .padding([0, 12])
+                        .style(move |_, status| outline_pill_btn(p, active, status))
+                        .on_press(Message::SetAudioQuality(q)),
+                );
+            }
+            let quality_card = setting_card(q_row.into());
+
+            column![autoplay_card, speed_card, vol_card, quality_card]
                 .spacing(10)
                 .into()
         }
@@ -1365,9 +1663,64 @@ fn view_settings<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
                 .spacing(10)
                 .into(),
             );
-            column![cache_card].spacing(10).into()
+            let proxy_card = setting_card(
+                column![
+                    text(t(app.lang, "proxy_url")).size(14).color(p.on_surface),
+                    text(t(app.lang, "proxy_hint")).size(12).color(p.outline),
+                    row![
+                        text_input("http://127.0.0.1:8080", &app.proxy_input)
+                            .on_input(Message::ProxyInputChanged)
+                            .padding([8, 12])
+                            .size(13)
+                            .style(move |_, status| modal_input_style(p, status)),
+                        button(text(t(app.lang, "save")).size(13))
+                            .height(36)
+                            .padding([0, 16])
+                            .style(move |_, status| pill_primary_btn(p, status))
+                            .on_press(Message::SaveProxyUrl),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(8)
+                .into(),
+            );
+            column![cache_card, proxy_card].spacing(10).into()
         }
         SettingsTab::About => {
+            let mut update_row = row![
+                button(
+                    text(if app.update_checking {
+                        t(app.lang, "checking_updates")
+                    } else {
+                        t(app.lang, "check_updates")
+                    })
+                    .size(13),
+                )
+                .height(36)
+                .padding([0, 16])
+                .style(move |_, status| outline_pill_btn(p, false, status))
+                .on_press(Message::CheckForUpdates),
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center);
+            if app.update_info.is_some() {
+                update_row = update_row.push(
+                    button(text(t(app.lang, "install_update")).size(13))
+                        .height(36)
+                        .padding([0, 16])
+                        .style(move |_, status| pill_primary_btn(p, status))
+                        .on_press(Message::InstallUpdate),
+                );
+            }
+            if let Some(ref st) = app.update_status {
+                let msg = if st == "up_to_date" {
+                    t(app.lang, "up_to_date")
+                } else {
+                    st.as_str()
+                };
+                update_row = update_row.push(text(msg).size(12).color(p.on_surface_variant));
+            }
             let about_card = setting_card(
                 column![
                     text("Raser").size(20).color(p.on_surface),
@@ -1384,8 +1737,9 @@ fn view_settings<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
                     ))
                     .size(13)
                     .color(p.on_surface_variant),
+                    update_row,
                 ]
-                .spacing(6)
+                .spacing(8)
                 .into(),
             );
             let shortcuts_card = setting_card(
