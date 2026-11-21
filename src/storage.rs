@@ -549,6 +549,9 @@ pub struct AppSettings {
     pub theme_mode: String,
     pub palette_style: String,
     pub ui_scale: u32,
+    pub audio_quality: String,
+    pub proxy_url: String,
+    pub search_history: Vec<String>,
     pub advanced: AdvancedPrefs,
 }
 
@@ -570,6 +573,9 @@ impl Default for AppSettings {
             theme_mode: "dark".to_string(),
             palette_style: "classic".to_string(),
             ui_scale: 100,
+            audio_quality: "high".to_string(),
+            proxy_url: String::new(),
+            search_history: Vec::new(),
             advanced: AdvancedPrefs::default(),
         }
     }
@@ -974,6 +980,18 @@ impl AppStateSnapshot {
         if let Some(sc) = decode_u32_field(&map, &["devsize_ui_scale"]) {
             settings.ui_scale = sc.clamp(80, 130);
         }
+        if let Some(aq) = decode_string_field(&map, &["riff_audio_quality", "raser_audio_quality"]) {
+            settings.audio_quality = aq;
+        }
+        if let Some(px) = decode_string_field(&map, &["riff_proxy_url", "raser_proxy_url", "riff_proxy"]) {
+            settings.proxy_url = px;
+        }
+        if let Some(sh) = decode_json_vec_field::<String>(
+            &map,
+            &["devsize_search_history", "riff_search_history", "raser_search_history"],
+        ) {
+            settings.search_history = sh;
+        }
 
         // Load optional fallback riff_advanced_prefs object first, then override with individual riff_adv_<name> keys
         let mut adv = decode_json_field::<AdvancedPrefs>(
@@ -1149,6 +1167,19 @@ impl AppStateSnapshot {
             "devsize_ui_scale".to_string(),
             Value::String(self.settings.ui_scale.to_string()),
         );
+        set_mirrored(
+            &mut map,
+            "audio_quality",
+            self.settings.audio_quality.clone(),
+        );
+        set_mirrored(&mut map, "proxy_url", self.settings.proxy_url.clone());
+        let sh_json =
+            serde_json::to_string(&self.settings.search_history).unwrap_or_else(|_| "[]".into());
+        map.insert(
+            "devsize_search_history".to_string(),
+            Value::String(sh_json.clone()),
+        );
+        set_mirrored(&mut map, "search_history", sh_json);
 
         let set_adv = |m: &mut HashMap<String, Value>, name: &str, v: bool| {
             let s = if v { "true" } else { "false" }.to_string();
