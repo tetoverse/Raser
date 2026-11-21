@@ -26,10 +26,9 @@ pub fn extract_sc_client_id_from_script(js: &str) -> Option<String> {
             .or_else(|| trimmed.strip_prefix('='))
         {
             let after_ws = after_op.trim_start();
-            let quote = after_ws.chars().next();
-            if quote == Some('"') || quote == Some('\'') {
+            if let Some(q) = after_ws.chars().next().filter(|&c| c == '"' || c == '\'') {
                 let inner = &after_ws[1..];
-                if let Some(end_q) = inner.find(quote.unwrap()) {
+                if let Some(end_q) = inner.find(q) {
                     let candidate = &inner[..end_q];
                     if candidate.len() == 32
                         && candidate.bytes().all(|b| b.is_ascii_alphanumeric())

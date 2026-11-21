@@ -31,7 +31,7 @@ where
     let opts = app::parse_cli_args(args);
     if opts.show_help {
         println!(
-            "Raser {}\nUsage: raser [--view <discover|favorites|albums|local|history|queue|settings>] [--headless-check] [--help]",
+            "Raser {}\nUsage: raser [--view <discover|search|visualizer|karaoke|favorites|albums|local|history|queue|settings>] [--headless-check] [--help]",
             updater::CURRENT_VERSION
         );
         return Ok(());

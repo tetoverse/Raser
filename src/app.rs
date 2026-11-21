@@ -2251,6 +2251,7 @@ impl RaserApp {
                 while let Ok(cmd) = self.media_rx.try_recv() {
                     pending_cmds.push(cmd);
                 }
+                let mut tick_tasks: Vec<Task<Message>> = Vec::new();
                 for cmd in pending_cmds {
                     let task = match cmd {
                         MediaCommand::PlayPause => self.update(Message::TogglePlayPause),
@@ -2271,11 +2272,7 @@ impl RaserApp {
                         }
                         MediaCommand::Quit => self.update(Message::QuitApp),
                     };
-                    if let Some(_unused) = Option::<()>::None {
-                        let _ = task;
-                    }
-                    // For immediate playback/window tasks triggered asynchronously from tray/hotkeys:
-                    return task;
+                    tick_tasks.push(task);
                 }
 
                 if self.window_hidden_to_tray
@@ -2348,7 +2345,7 @@ impl RaserApp {
                 if st.ended && !prev_ended && !self.seek_coordinator.is_loading && !st.loading {
                     if self.snapshot.settings.repeat_mode == RepeatMode::One {
                         if let Some(tr) = self.current_track() {
-                            return self.load_track_task(&tr, false);
+                            tick_tasks.push(self.load_track_task(&tr, false));
                         }
                     } else if self.snapshot.settings.advanced.autoplay
                         || self.snapshot.settings.repeat_mode == RepeatMode::All
@@ -2357,15 +2354,19 @@ impl RaserApp {
                             .map(|i| i + 1 < self.queue.len())
                             .unwrap_or(false)
                     {
-                        return self.play_next();
+                        tick_tasks.push(self.play_next());
                     }
                 }
 
                 if self.titlebar_hover_left_at.is_some() {
-                    return self.update(Message::TitlebarHideCheck);
+                    tick_tasks.push(self.update(Message::TitlebarHideCheck));
                 }
 
-                Task::none()
+                if tick_tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tick_tasks)
+                }
             }
             Message::PickLocalFiles => Task::perform(
                 async {
