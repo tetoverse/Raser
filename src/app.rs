@@ -1232,7 +1232,12 @@ impl RaserApp {
                 let p = if !tr.path.is_empty() {
                     tr.path.clone()
                 } else {
-                    tr.url.clone()
+                    let ps = tr.playable_source();
+                    if !ps.is_empty() {
+                        ps
+                    } else {
+                        tr.url.clone()
+                    }
                 };
                 if !p.is_empty() && !self.snapshot.removed_local_paths.contains(&p) {
                     self.snapshot.removed_local_paths.push(p);
