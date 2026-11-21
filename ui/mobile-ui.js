@@ -492,17 +492,42 @@
     // Touch scrubbing on Raser wavy progress bar in Now Playing sheet
     const scrubberTrack = document.getElementById('scrubber-track');
     if (scrubberTrack && audio) {
-      const seekFromTouch = (touch) => {
+      let mobileSeekTimer = null;
+      let lastMobileSeekMs = 0;
+      let pendingMobileTarget = null;
+      const MOBILE_SEEK_THROTTLE_MS = 120;
+
+      const flushMobileSeek = () => {
+        if (mobileSeekTimer) {
+          clearTimeout(mobileSeekTimer);
+          mobileSeekTimer = null;
+        }
+        if (pendingMobileTarget !== null) {
+          const target = pendingMobileTarget;
+          pendingMobileTarget = null;
+          lastMobileSeekMs = performance.now();
+          audio.currentTime = target;
+        }
+      };
+
+      const seekFromTouch = (touch, immediate = false) => {
         const rect = scrubberTrack.getBoundingClientRect();
         if (rect.width <= 0) return;
         const pos = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width));
         if (isFinite(audio.duration) && audio.duration > 0) {
-          audio.currentTime = pos * audio.duration;
+          const target = pos * audio.duration;
+          pendingMobileTarget = target;
           const curr = document.getElementById('time-current');
           if (curr) {
-            const m = Math.floor(audio.currentTime / 60);
-            const s = Math.floor(audio.currentTime % 60);
+            const m = Math.floor(target / 60);
+            const s = Math.floor(target % 60);
             curr.textContent = `${m}:${s < 10 ? '0' : ''}${s}`;
+          }
+          const elapsed = performance.now() - lastMobileSeekMs;
+          if (immediate || elapsed >= MOBILE_SEEK_THROTTLE_MS) {
+            flushMobileSeek();
+          } else if (!mobileSeekTimer) {
+            mobileSeekTimer = setTimeout(flushMobileSeek, MOBILE_SEEK_THROTTLE_MS - elapsed);
           }
           if (typeof window.resizeCanvases === 'function') window.resizeCanvases();
         }
@@ -511,21 +536,27 @@
       scrubberTrack.addEventListener('touchstart', (e) => {
         if (!document.body.classList.contains('np-open')) return;
         e.stopPropagation();
-        seekFromTouch(e.touches[0]);
+        seekFromTouch(e.touches[0], true);
       }, { passive: false });
 
       scrubberTrack.addEventListener('touchmove', (e) => {
         if (!document.body.classList.contains('np-open')) return;
         e.stopPropagation();
         e.preventDefault();
-        seekFromTouch(e.touches[0]);
+        seekFromTouch(e.touches[0], false);
       }, { passive: false });
 
-      scrubberTrack.addEventListener('touchend', (e) => {
+      const endTouchSeek = (e) => {
         if (!document.body.classList.contains('np-open')) return;
         e.stopPropagation();
-        if (e.changedTouches && e.changedTouches[0]) seekFromTouch(e.changedTouches[0]);
-      });
+        if (e.changedTouches && e.changedTouches[0]) {
+          seekFromTouch(e.changedTouches[0], true);
+        } else {
+          flushMobileSeek();
+        }
+      };
+      scrubberTrack.addEventListener('touchend', endTouchSeek);
+      scrubberTrack.addEventListener('touchcancel', endTouchSeek);
     }
   }
 

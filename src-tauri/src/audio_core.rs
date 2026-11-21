@@ -1,8 +1,9 @@
 use crate::storage;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rodio::decoder::Decoder;
 use rodio::source::Source;
@@ -15,6 +16,17 @@ use serde::{Deserialize, Serialize};
 const FFT_SAMPLE_COUNT: usize = 512;
 const FFT_BIN_COUNT: usize = 64;
 const PROGRESSIVE_PREBUFFER_BYTES: usize = 192 * 1024;
+const PROGRESSIVE_SEEK_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+const INITIAL_STREAM_CAP_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct SharedBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 struct ProgressiveBuffer {
     data: Vec<u8>,
@@ -27,6 +39,19 @@ struct SharedProgressive {
     state: Mutex<ProgressiveBuffer>,
     condvar: Condvar,
     load_gen: Arc<AtomicU64>,
+}
+
+struct SeekCancelContext {
+    seek_gen: Arc<AtomicU64>,
+    expected_seek_gen: u64,
+    preparing: Arc<AtomicBool>,
+}
+
+impl SeekCancelContext {
+    fn is_superseded(&self) -> bool {
+        self.preparing.load(Ordering::SeqCst)
+            && self.seek_gen.load(Ordering::SeqCst) != self.expected_seek_gen
+    }
 }
 
 fn shared_http_client() -> Result<&'static reqwest::blocking::Client, String> {
@@ -47,6 +72,7 @@ struct ProgressiveReader {
     shared: Arc<SharedProgressive>,
     pos: u64,
     expected_gen: u64,
+    seek_cancel: Option<SeekCancelContext>,
 }
 
 impl ProgressiveReader {
@@ -55,7 +81,46 @@ impl ProgressiveReader {
             shared,
             pos: 0,
             expected_gen,
+            seek_cancel: None,
         }
+    }
+
+    fn new_for_seek(
+        shared: Arc<SharedProgressive>,
+        expected_gen: u64,
+        seek_gen: Arc<AtomicU64>,
+        expected_seek_gen: u64,
+        preparing: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            shared,
+            pos: 0,
+            expected_gen,
+            seek_cancel: Some(SeekCancelContext {
+                seek_gen,
+                expected_seek_gen,
+                preparing,
+            }),
+        }
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.shared.load_gen.load(Ordering::SeqCst) != self.expected_gen {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer load"));
+        }
+        if let Some(ref cancel) = self.seek_cancel {
+            if cancel.is_superseded() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer seek"));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_preparing_seek(&self) -> bool {
+        self.seek_cancel
+            .as_ref()
+            .map(|c| c.preparing.load(Ordering::SeqCst))
+            .unwrap_or(false)
     }
 }
 
@@ -67,11 +132,11 @@ impl Read for ProgressiveReader {
         let mut state = self.shared.state.lock().map_err(|_| {
             io::Error::new(io::ErrorKind::Other, "Progressive buffer lock poisoned")
         })?;
+        let mut last_len = state.data.len();
+        let mut last_progress = Instant::now();
 
         loop {
-            if self.shared.load_gen.load(Ordering::SeqCst) != self.expected_gen {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer load"));
-            }
+            self.check_cancelled()?;
 
             let available = state.data.len() as u64;
             if self.pos < available {
@@ -88,6 +153,18 @@ impl Read for ProgressiveReader {
 
             if let Some(ref err) = state.error {
                 return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+            }
+
+            if state.data.len() != last_len {
+                last_len = state.data.len();
+                last_progress = Instant::now();
+            } else if self.is_preparing_seek()
+                && last_progress.elapsed() >= PROGRESSIVE_SEEK_STALL_TIMEOUT
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out waiting for stream data during seek",
+                ));
             }
 
             let (guard, _) = self
@@ -107,15 +184,15 @@ impl Seek for ProgressiveReader {
         let mut state = self.shared.state.lock().map_err(|_| {
             io::Error::new(io::ErrorKind::Other, "Progressive buffer lock poisoned")
         })?;
+        let mut last_len = state.data.len();
+        let mut last_progress = Instant::now();
 
         let new_pos: i64 = match style {
             SeekFrom::Start(offset) => offset as i64,
             SeekFrom::Current(offset) => (self.pos as i64).saturating_add(offset),
             SeekFrom::End(offset) => {
                 loop {
-                    if self.shared.load_gen.load(Ordering::SeqCst) != self.expected_gen {
-                        return Err(io::Error::new(io::ErrorKind::Interrupted, "Superseded by newer load"));
-                    }
+                    self.check_cancelled()?;
                     if let Some(total) = state.total_len {
                         break (total as i64).saturating_add(offset);
                     }
@@ -124,6 +201,17 @@ impl Seek for ProgressiveReader {
                     }
                     if let Some(ref err) = state.error {
                         return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+                    }
+                    if state.data.len() != last_len {
+                        last_len = state.data.len();
+                        last_progress = Instant::now();
+                    } else if self.is_preparing_seek()
+                        && last_progress.elapsed() >= PROGRESSIVE_SEEK_STALL_TIMEOUT
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Timed out waiting for stream length during seek",
+                        ));
                     }
                     let (guard, _) = self
                         .shared
@@ -176,6 +264,38 @@ pub struct VisualizerSource<S> {
     sample_accum: f32,
     channel_idx: usize,
     producer: rtrb::Producer<f32>,
+    last_sample_rate: u32,
+    frames_since_rate_change: u64,
+    accum_secs: f64,
+    elapsed_secs_bits: Arc<AtomicU64>,
+    seek_offset_bits: Arc<AtomicU64>,
+}
+
+impl<S> VisualizerSource<S>
+where
+    S: Source<Item = rodio::Sample>,
+{
+    fn new(
+        inner: S,
+        producer: rtrb::Producer<f32>,
+        elapsed_secs_bits: Arc<AtomicU64>,
+        seek_offset_bits: Arc<AtomicU64>,
+    ) -> Self {
+        let channels = (inner.channels().get() as usize).max(1);
+        let last_sample_rate = inner.sample_rate().get().max(1);
+        Self {
+            inner,
+            channels,
+            sample_accum: 0.0,
+            channel_idx: 0,
+            producer,
+            last_sample_rate,
+            frames_since_rate_change: 0,
+            accum_secs: 0.0,
+            elapsed_secs_bits,
+            seek_offset_bits,
+        }
+    }
 }
 
 impl<S> Iterator for VisualizerSource<S>
@@ -195,6 +315,18 @@ where
             let _ = self.producer.push(mono_sample);
             self.sample_accum = 0.0;
             self.channel_idx = 0;
+
+            let sr = self.inner.sample_rate().get().max(1);
+            if sr != self.last_sample_rate {
+                self.accum_secs +=
+                    self.frames_since_rate_change as f64 / self.last_sample_rate as f64;
+                self.frames_since_rate_change = 0;
+                self.last_sample_rate = sr;
+            }
+            self.frames_since_rate_change += 1;
+            let elapsed = self.accum_secs + (self.frames_since_rate_change as f64 / sr as f64);
+            self.elapsed_secs_bits
+                .store(elapsed.to_bits(), Ordering::Relaxed);
         }
         Some(sample)
     }
@@ -231,7 +363,19 @@ where
 
     #[inline]
     fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
-        self.inner.try_seek(pos)
+        let res = self.inner.try_seek(pos);
+        if res.is_ok() {
+            self.sample_accum = 0.0;
+            self.channel_idx = 0;
+            self.accum_secs = 0.0;
+            self.frames_since_rate_change = 0;
+            self.last_sample_rate = self.inner.sample_rate().get().max(1);
+            self.elapsed_secs_bits
+                .store(0.0f64.to_bits(), Ordering::Relaxed);
+            self.seek_offset_bits
+                .store(pos.as_secs_f64().to_bits(), Ordering::SeqCst);
+        }
+        res
     }
 }
 
@@ -257,7 +401,8 @@ pub struct AudioCore {
     hann_window: Vec<f32>,
     cached_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
     active_progressive: Arc<Mutex<Option<(Arc<SharedProgressive>, u64)>>>,
-    seek_offset_secs: Mutex<f64>,
+    seek_offset_bits: Arc<AtomicU64>,
+    source_elapsed_bits: Mutex<Arc<AtomicU64>>,
     current_url: Arc<Mutex<Option<String>>>,
     current_duration: Arc<Mutex<f64>>,
     current_error: Arc<Mutex<Option<String>>>,
@@ -268,6 +413,16 @@ pub struct AudioCore {
     volume: Arc<Mutex<f32>>,
     speed: Arc<Mutex<f32>>,
     load_generation: Arc<AtomicU64>,
+    seek_generation: Arc<AtomicU64>,
+    active_seek_count: Arc<AtomicUsize>,
+}
+
+struct SeekCountGuard(Arc<AtomicUsize>);
+
+impl Drop for SeekCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl AudioCore {
@@ -290,7 +445,8 @@ impl AudioCore {
             hann_window,
             cached_bytes: Arc::new(Mutex::new(None)),
             active_progressive: Arc::new(Mutex::new(None)),
-            seek_offset_secs: Mutex::new(0.0),
+            seek_offset_bits: Arc::new(AtomicU64::new(0.0f64.to_bits())),
+            source_elapsed_bits: Mutex::new(Arc::new(AtomicU64::new(0.0f64.to_bits()))),
             current_url: Arc::new(Mutex::new(None)),
             current_duration: Arc::new(Mutex::new(0.0)),
             current_error: Arc::new(Mutex::new(None)),
@@ -301,6 +457,8 @@ impl AudioCore {
             volume: Arc::new(Mutex::new(0.85)),
             speed: Arc::new(Mutex::new(1.0)),
             load_generation: Arc::new(AtomicU64::new(0)),
+            seek_generation: Arc::new(AtomicU64::new(0)),
+            active_seek_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -406,114 +564,271 @@ impl AudioCore {
         }
     }
 
-    pub fn seek(&self, position_secs: f64) -> Result<(), String> {
+    fn build_buffered_decoder(
+        bytes: &Arc<Vec<u8>>,
+        coarse_seek: bool,
+    ) -> Result<Decoder<Cursor<SharedBytes>>, rodio::decoder::DecoderError> {
+        let byte_len = bytes.len() as u64;
+        let cursor = Cursor::new(SharedBytes(Arc::clone(bytes)));
+        Decoder::builder()
+            .with_data(cursor)
+            .with_byte_len(byte_len)
+            .with_seekable(true)
+            .with_coarse_seek(coarse_seek)
+            .build()
+    }
+
+    fn is_accurate_seek_unsupported(err: &rodio::source::SeekError) -> bool {
+        matches!(
+            err,
+            rodio::source::SeekError::SymphoniaDecoder(
+                rodio::decoder::symphonia::SeekError::AccurateSeekNotSupported
+            )
+        )
+    }
+
+    fn prepare_seeked_buffered_decoder(
+        bytes: &Arc<Vec<u8>>,
+        target_pos: Duration,
+        clamped_pos: f64,
+    ) -> Result<(Decoder<Cursor<SharedBytes>>, f64), String> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut decoder = Self::build_buffered_decoder(bytes, false)
+                .map_err(|e| format!("Decoder initialization failed during seek: {:?}", e))?;
+            if target_pos <= Duration::from_millis(50) {
+                return Ok((decoder, 0.0));
+            }
+            match decoder.try_seek(target_pos) {
+                Ok(()) => Ok((decoder, clamped_pos)),
+                Err(ref e) if Self::is_accurate_seek_unsupported(e) => {
+                    let mut coarse_decoder = Self::build_buffered_decoder(bytes, true)
+                        .map_err(|err| format!("Coarse decoder initialization failed: {:?}", err))?;
+                    coarse_decoder
+                        .try_seek(target_pos)
+                        .map(|()| (coarse_decoder, clamped_pos))
+                        .map_err(|err| format!("Coarse seek failed: {:?}", err))
+                }
+                Err(e) => Err(format!("Seek failed: {:?}", e)),
+            }
+        }))
+        .map_err(|_| "Audio decoder panicked during seek".to_string())?
+    }
+
+    fn prepare_seeked_progressive_decoder(
+        shared_prog: &Arc<SharedProgressive>,
+        prog_gen: u64,
+        seek_gen: &Arc<AtomicU64>,
+        my_seek_gen: u64,
+        target_pos: Duration,
+        clamped_pos: f64,
+    ) -> Result<(Decoder<ProgressiveReader>, f64, Arc<AtomicBool>), String> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let preparing = Arc::new(AtomicBool::new(true));
+            let reader = ProgressiveReader::new_for_seek(
+                Arc::clone(shared_prog),
+                prog_gen,
+                Arc::clone(seek_gen),
+                my_seek_gen,
+                Arc::clone(&preparing),
+            );
+            let mut decoder = Decoder::new(reader)
+                .map_err(|e| format!("Stream decoder initialization failed during seek: {:?}", e))?;
+            if target_pos <= Duration::from_millis(50) {
+                return Ok((decoder, 0.0, preparing));
+            }
+            match decoder.try_seek(target_pos) {
+                Ok(()) => Ok((decoder, clamped_pos, preparing)),
+                Err(ref e) if Self::is_accurate_seek_unsupported(e) => {
+                    let coarse_reader = ProgressiveReader::new_for_seek(
+                        Arc::clone(shared_prog),
+                        prog_gen,
+                        Arc::clone(seek_gen),
+                        my_seek_gen,
+                        Arc::clone(&preparing),
+                    );
+                    let mut coarse_decoder = Decoder::builder()
+                        .with_data(coarse_reader)
+                        .with_coarse_seek(true)
+                        .build()
+                        .map_err(|err| format!("Coarse stream decoder init failed: {:?}", err))?;
+                    coarse_decoder
+                        .try_seek(target_pos)
+                        .map(|()| (coarse_decoder, clamped_pos, preparing))
+                        .map_err(|err| format!("Coarse stream seek failed: {:?}", err))
+                }
+                Err(e) => Err(format!("Stream seek failed: {:?}", e)),
+            }
+        }))
+        .map_err(|_| "Stream decoder panicked during seek".to_string())?
+    }
+
+    fn begin_seek_generation(&self) -> u64 {
+        let seek_gen = self.seek_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(prog_guard) = self.active_progressive.lock() {
+            if let Some((ref shared_prog, _)) = *prog_guard {
+                shared_prog.condvar.notify_all();
+            }
+        }
+        seek_gen
+    }
+
+    fn is_seek_current(&self, my_seek_gen: u64, expected_load_gen: u64) -> bool {
+        self.seek_generation.load(Ordering::SeqCst) == my_seek_gen
+            && self.load_generation.load(Ordering::SeqCst) == expected_load_gen
+    }
+
+    fn commit_seeked_source<S>(
+        &self,
+        source: S,
+        actual_offset: f64,
+        my_seek_gen: u64,
+        expected_load_gen: u64,
+        preparing_flag: Option<&Arc<AtomicBool>>,
+    ) -> Result<(), String>
+    where
+        S: Source<Item = rodio::Sample> + Send + 'static,
+    {
+        let player_guard = self.player.lock().map_err(|e| e.to_string())?;
+        if !self.is_seek_current(my_seek_gen, expected_load_gen) {
+            return Err("Seek superseded".to_string());
+        }
+
+        if let Some(flag) = preparing_flag {
+            flag.store(false, Ordering::SeqCst);
+        }
+
+        let (producer, consumer) = rtrb::RingBuffer::new(4096);
+        let elapsed_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+        let viz_source = VisualizerSource::new(
+            source,
+            producer,
+            Arc::clone(&elapsed_bits),
+            Arc::clone(&self.seek_offset_bits),
+        );
+
+        if let Some(player) = player_guard.as_ref() {
+            player.clear();
+            *self.consumer.lock().unwrap_or_else(|e| e.into_inner()) = Some(consumer);
+            *self
+                .source_elapsed_bits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = elapsed_bits;
+            self.seek_offset_bits
+                .store(actual_offset.to_bits(), Ordering::SeqCst);
+            self.has_ended.store(false, Ordering::SeqCst);
+            if actual_offset <= 1.0 {
+                self.track_has_played.store(false, Ordering::SeqCst);
+            }
+            player.append(viz_source);
+            let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
+            let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
+            player.set_volume(vol);
+            player.set_speed(spd);
+            if self.is_playing.load(Ordering::SeqCst) {
+                player.play();
+            } else {
+                player.pause();
+            }
+            Ok(())
+        } else {
+            Err("Audio player is not initialized".to_string())
+        }
+    }
+
+    pub async fn seek_async(self: &Arc<Self>, position_secs: f64) -> Result<AudioState, String> {
+        let my_seek_gen = self.begin_seek_generation();
+        let this = Arc::clone(self);
+        tauri::async_runtime::spawn_blocking(move || this.seek_with_gen(position_secs, my_seek_gen))
+            .await
+            .map_err(|e| format!("Seek task execution error: {:?}", e))?
+    }
+
+    pub fn seek(&self, position_secs: f64) -> Result<AudioState, String> {
+        let my_seek_gen = self.begin_seek_generation();
+        self.seek_with_gen(position_secs, my_seek_gen)
+    }
+
+    fn seek_with_gen(&self, position_secs: f64, my_seek_gen: u64) -> Result<AudioState, String> {
+        self.active_seek_count.fetch_add(1, Ordering::SeqCst);
+        let _seek_guard = SeekCountGuard(Arc::clone(&self.active_seek_count));
+
+        if self.is_loading.load(Ordering::SeqCst) {
+            return Err("Audio is still loading".to_string());
+        }
+
+        let expected_load_gen = self.load_generation.load(Ordering::SeqCst);
+        if !self.is_seek_current(my_seek_gen, expected_load_gen) {
+            return Err("Seek superseded".to_string());
+        }
+
         self.ensure_player()?;
         let dur = *self.current_duration.lock().unwrap_or_else(|e| e.into_inner());
         let clamped_pos = Self::clamp_seek_position(position_secs, dur);
         let target_pos = Duration::from_secs_f64(clamped_pos);
+
+        // Priority 1: Reconstruct decoder from cached full bytes in memory using zero-copy SharedBytes.
+        if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
+            if !self.is_seek_current(my_seek_gen, expected_load_gen) {
+                return Err("Seek superseded".to_string());
+            }
+            let (decoder, actual_offset) =
+                Self::prepare_seeked_buffered_decoder(&bytes_arc, target_pos, clamped_pos)?;
+            self.commit_seeked_source(decoder, actual_offset, my_seek_gen, expected_load_gen, None)?;
+            return Ok(self.get_state());
+        }
+
+        // Priority 2: Reconstruct decoder from active progressive stream buffer.
+        if let Some((shared_prog, prog_gen)) =
+            self.active_progressive.lock().map_err(|e| e.to_string())?.clone()
+        {
+            if prog_gen == expected_load_gen && self.is_seek_current(my_seek_gen, expected_load_gen) {
+                let (decoder, actual_offset, preparing) = Self::prepare_seeked_progressive_decoder(
+                    &shared_prog,
+                    prog_gen,
+                    &self.seek_generation,
+                    my_seek_gen,
+                    target_pos,
+                    clamped_pos,
+                )?;
+                self.commit_seeked_source(
+                    decoder,
+                    actual_offset,
+                    my_seek_gen,
+                    expected_load_gen,
+                    Some(&preparing),
+                )?;
+                return Ok(self.get_state());
+            }
+            return Err("Seek superseded".to_string());
+        }
+
+        // Priority 3: Fallback to in-stream try_seek only if neither buffer is available.
+        let player_guard = self.player.lock().map_err(|e| e.to_string())?;
+        if !self.is_seek_current(my_seek_gen, expected_load_gen) {
+            return Err("Seek superseded".to_string());
+        }
+        let player = player_guard
+            .as_ref()
+            .ok_or_else(|| "Audio player is not initialized".to_string())?;
+        if player.empty() {
+            return Err("No active audio source to seek".to_string());
+        }
+        let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
+        let player_target = Duration::from_secs_f64(clamped_pos / spd.max(0.25) as f64);
+        player
+            .try_seek(player_target)
+            .map_err(|e| format!("In-stream seek failed: {:?}", e))?;
+        self.seek_offset_bits
+            .store(clamped_pos.to_bits(), Ordering::SeqCst);
         self.has_ended.store(false, Ordering::SeqCst);
         if clamped_pos <= 1.0 {
             self.track_has_played.store(false, Ordering::SeqCst);
         }
-
-        // Priority 1: Reconstruct decoder from cached full bytes in memory.
-        // Symphonia/Rodio's in-place player.try_seek(0) on fragmented MP4/WebM streams
-        // frequently returns Ok(()) while leaving the decoder at EOF (silent), so rebuilding
-        // from the in-memory buffer guarantees an instant, glitch-free seek and restart.
-        if let Some(bytes_arc) = self.cached_bytes.lock().map_err(|e| e.to_string())?.clone() {
-            let cursor = Cursor::new(bytes_arc.as_ref().clone());
-            if let Ok(mut decoder) = Decoder::new(cursor) {
-                let actual_offset = if target_pos > Duration::from_millis(50) {
-                    match decoder.try_seek(target_pos) {
-                        Ok(()) => clamped_pos,
-                        Err(_) => 0.0,
-                    }
-                } else {
-                    0.0
-                };
-                let channels = decoder.channels().get() as usize;
-                let (producer, consumer) = rtrb::RingBuffer::new(4096);
-                *self.consumer.lock().unwrap() = Some(consumer);
-
-                let viz_source = VisualizerSource {
-                    inner: decoder,
-                    channels: channels.max(1),
-                    sample_accum: 0.0,
-                    channel_idx: 0,
-                    producer,
-                };
-
-                if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
-                    player.clear();
-                    player.append(viz_source);
-                    *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = actual_offset;
-                    let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
-                    let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
-                    player.set_volume(vol);
-                    player.set_speed(spd);
-                    if self.is_playing.load(Ordering::SeqCst) {
-                        player.play();
-                    } else {
-                        player.pause();
-                    }
-                }
-                return Ok(());
-            }
+        if self.is_playing.load(Ordering::SeqCst) {
+            player.play();
         }
-
-        // Priority 2: Reconstruct decoder from active progressive stream buffer
-        if let Some((shared_prog, prog_gen)) = self.active_progressive.lock().map_err(|e| e.to_string())?.clone() {
-            if self.load_generation.load(Ordering::SeqCst) == prog_gen {
-                let reader = ProgressiveReader::new(shared_prog, prog_gen);
-                if let Ok(mut decoder) = Decoder::new(reader) {
-                    let actual_offset = if target_pos > Duration::from_millis(50) {
-                        match decoder.try_seek(target_pos) {
-                            Ok(()) => clamped_pos,
-                            Err(_) => 0.0,
-                        }
-                    } else {
-                        0.0
-                    };
-                    let channels = decoder.channels().get() as usize;
-                    let (producer, consumer) = rtrb::RingBuffer::new(4096);
-                    *self.consumer.lock().unwrap() = Some(consumer);
-
-                    let viz_source = VisualizerSource {
-                        inner: decoder,
-                        channels: channels.max(1),
-                        sample_accum: 0.0,
-                        channel_idx: 0,
-                        producer,
-                    };
-
-                    if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
-                        player.clear();
-                        player.append(viz_source);
-                        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = actual_offset;
-                        let vol = *self.volume.lock().unwrap_or_else(|e| e.into_inner());
-                        let spd = *self.speed.lock().unwrap_or_else(|e| e.into_inner());
-                        player.set_volume(vol);
-                        player.set_speed(spd);
-                        if self.is_playing.load(Ordering::SeqCst) {
-                            player.play();
-                        } else {
-                            player.pause();
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
-
-        // Priority 3: Fallback to in-stream try_seek if neither buffer is available
-        if let Some(player) = self.player.lock().map_err(|e| e.to_string())?.as_ref() {
-            if !player.empty() && player.try_seek(target_pos).is_ok() {
-                if self.is_playing.load(Ordering::SeqCst) {
-                    player.play();
-                }
-            }
-        }
-        Ok(())
+        drop(player_guard);
+        Ok(self.get_state())
     }
 
     pub async fn load_audio_async(
@@ -525,20 +840,34 @@ impl AudioCore {
         track_id: Option<String>,
     ) -> Result<AudioState, String> {
         let current_gen = self.load_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Cancel any in-flight seek generation from the previous track
+        self.seek_generation.fetch_add(1, Ordering::SeqCst);
         self.is_loading.store(true, Ordering::SeqCst);
         self.has_ended.store(false, Ordering::SeqCst);
         self.track_has_played.store(false, Ordering::SeqCst);
         if autoplay {
             self.is_playing.store(true, Ordering::SeqCst);
         }
-        *self.current_error.lock().unwrap() = None;
-        *self.current_url.lock().unwrap() = Some(url.clone());
-        *self.active_progressive.lock().unwrap() = None;
-        *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *self.current_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+        *self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some((old_prog, _)) = self
+            .active_progressive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            old_prog.condvar.notify_all();
+        }
+        self.seek_offset_bits
+            .store(0.0f64.to_bits(), Ordering::SeqCst);
+        if let Ok(arc) = self.source_elapsed_bits.lock() {
+            arc.store(0.0f64.to_bits(), Ordering::Relaxed);
+        }
         if let Some(dur) = duration_hint {
-            *self.current_duration.lock().unwrap() = dur;
+            *self.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = dur;
         } else {
-            *self.current_duration.lock().unwrap() = 0.0;
+            *self.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         }
 
         // Immediately stop previous audio so there is no audio bleed while loading
@@ -573,7 +902,7 @@ impl AudioCore {
             }
 
             enum LoadedDecoder {
-                Buffered(Decoder<Cursor<Vec<u8>>>),
+                Buffered(Decoder<Cursor<SharedBytes>>),
                 Progressive(Decoder<ProgressiveReader>),
             }
 
@@ -617,7 +946,9 @@ impl AudioCore {
                 *this.cached_bytes.lock().unwrap() = None;
 
                 let total_len = resp.content_length();
-                let initial_cap = total_len.map(|l| l as usize).unwrap_or(3 * 1024 * 1024);
+                let initial_cap = total_len
+                    .map(|l| (l as usize).min(INITIAL_STREAM_CAP_LIMIT))
+                    .unwrap_or(3 * 1024 * 1024);
                 let shared = Arc::new(SharedProgressive {
                     state: Mutex::new(ProgressiveBuffer {
                         data: Vec::with_capacity(initial_cap),
@@ -782,13 +1113,12 @@ impl AudioCore {
                     return Err(e);
                 }
 
-                let cursor = Cursor::new(bytes_arc.as_ref().clone());
-                let decoder = match Decoder::new(cursor) {
+                let decoder = match Self::build_buffered_decoder(&bytes_arc, false) {
                     Ok(d) => d,
                     Err(e) => {
                         let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
                         log::error!("{}", err_msg);
-                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
+                        *this.current_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err_msg.clone());
                         this.is_loading.store(false, Ordering::SeqCst);
                         return Err(err_msg);
                     }
@@ -796,51 +1126,80 @@ impl AudioCore {
                 LoadedDecoder::Buffered(decoder)
             };
 
-            let (total_dur, channels) = match &loaded_decoder {
-                LoadedDecoder::Buffered(d) => (d.total_duration(), d.channels().get() as usize),
-                LoadedDecoder::Progressive(d) => (d.total_duration(), d.channels().get() as usize),
+            let total_dur = match &loaded_decoder {
+                LoadedDecoder::Buffered(d) => d.total_duration(),
+                LoadedDecoder::Progressive(d) => d.total_duration(),
             };
 
             let resolved_dur = AudioCore::resolve_duration(total_dur, duration_hint);
             if resolved_dur > 0.0 {
-                *this.current_duration.lock().unwrap() = resolved_dur;
+                *this.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = resolved_dur;
             }
 
-            let (producer, consumer) = rtrb::RingBuffer::new(4096);
-            *this.consumer.lock().unwrap() = Some(consumer);
+            let mut initial_offset = 0.0;
+            let loaded_decoder = if let Some(start_sec) = start_pos_secs.filter(|s| s.is_finite() && *s > 0.05) {
+                let clamped_start = Self::clamp_seek_position(start_sec, resolved_dur);
+                let target_start = Duration::from_secs_f64(clamped_start);
+                match loaded_decoder {
+                    LoadedDecoder::Buffered(mut decoder) => {
+                        if decoder.try_seek(target_start).is_ok() {
+                            initial_offset = clamped_start;
+                            LoadedDecoder::Buffered(decoder)
+                        } else if let Ok(fresh) = Self::build_buffered_decoder(&this.cached_bytes.lock().unwrap_or_else(|e| e.into_inner()).as_ref().unwrap(), false) {
+                            LoadedDecoder::Buffered(fresh)
+                        } else {
+                            LoadedDecoder::Buffered(decoder)
+                        }
+                    }
+                    LoadedDecoder::Progressive(mut decoder) => {
+                        if decoder.try_seek(target_start).is_ok() {
+                            initial_offset = clamped_start;
+                        }
+                        LoadedDecoder::Progressive(decoder)
+                    }
+                }
+            } else {
+                loaded_decoder
+            };
 
             if let Ok(player_guard) = this.player.lock() {
+                if this.load_generation.load(Ordering::SeqCst) != current_gen {
+                    return Err("Superseded by newer load".to_string());
+                }
                 if let Some(player) = player_guard.as_ref() {
+                    let (producer, consumer) = rtrb::RingBuffer::new(4096);
+                    let elapsed_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+
                     player.clear();
+                    *this.consumer.lock().unwrap_or_else(|e| e.into_inner()) = Some(consumer);
+                    *this
+                        .source_elapsed_bits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Arc::clone(&elapsed_bits);
+                    this.seek_offset_bits
+                        .store(initial_offset.to_bits(), Ordering::SeqCst);
+
                     match loaded_decoder {
                         LoadedDecoder::Buffered(decoder) => {
-                            player.append(VisualizerSource {
-                                inner: decoder,
-                                channels: channels.max(1),
-                                sample_accum: 0.0,
-                                channel_idx: 0,
+                            player.append(VisualizerSource::new(
+                                decoder,
                                 producer,
-                            });
+                                elapsed_bits,
+                                Arc::clone(&this.seek_offset_bits),
+                            ));
                         }
                         LoadedDecoder::Progressive(decoder) => {
-                            player.append(VisualizerSource {
-                                inner: decoder,
-                                channels: channels.max(1),
-                                sample_accum: 0.0,
-                                channel_idx: 0,
+                            player.append(VisualizerSource::new(
+                                decoder,
                                 producer,
-                            });
+                                elapsed_bits,
+                                Arc::clone(&this.seek_offset_bits),
+                            ));
                         }
                     }
 
-                    if let Some(start_sec) = start_pos_secs {
-                        if start_sec > 0.0 {
-                            let _ = player.try_seek(Duration::from_secs_f64(start_sec));
-                        }
-                    }
-
-                    let vol = *this.volume.lock().unwrap();
-                    let spd = *this.speed.lock().unwrap();
+                    let vol = *this.volume.lock().unwrap_or_else(|e| e.into_inner());
+                    let spd = *this.speed.lock().unwrap_or_else(|e| e.into_inner());
                     player.set_volume(vol);
                     player.set_speed(spd);
 
@@ -867,20 +1226,24 @@ impl AudioCore {
 
     pub fn get_state(&self) -> AudioState {
         let loading = self.is_loading.load(Ordering::SeqCst);
+        let seeking = self.active_seek_count.load(Ordering::SeqCst) > 0;
         let (pos, empty) = if loading {
             (0.0, false)
-        } else if let Ok(player_guard) = self.player.lock() {
-            if let Some(player) = player_guard.as_ref() {
-                let offset = *self.seek_offset_secs.lock().unwrap_or_else(|e| e.into_inner());
-                (offset + player.get_pos().as_secs_f64(), player.empty())
-            } else {
-                (0.0, true)
-            }
         } else {
-            (0.0, true)
+            let offset = f64::from_bits(self.seek_offset_bits.load(Ordering::SeqCst));
+            let elapsed = self
+                .source_elapsed_bits
+                .lock()
+                .map(|arc| f64::from_bits(arc.load(Ordering::Relaxed)))
+                .unwrap_or(0.0);
+            let empty = match self.player.try_lock() {
+                Ok(player_guard) => player_guard.as_ref().map(|p| p.empty()).unwrap_or(true),
+                Err(_) => false,
+            };
+            (offset + elapsed, empty)
         };
 
-        if !loading && pos > 0.1 {
+        if !loading && !seeking && pos > 0.1 {
             self.track_has_played.store(true, Ordering::SeqCst);
         }
 
@@ -892,7 +1255,7 @@ impl AudioCore {
         let error = self.current_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let track_played = self.track_has_played.load(Ordering::SeqCst);
-        let ended = if !loading && empty && track_played {
+        let ended = if !loading && !seeking && empty && track_played {
             self.has_ended.store(true, Ordering::SeqCst);
             self.is_playing.store(false, Ordering::SeqCst);
             true
@@ -1049,5 +1412,208 @@ mod tests {
         assert!((AudioCore::clamp_seek_position(500.0, 383.0) - 382.9).abs() < 0.001);
         assert!((AudioCore::clamp_seek_position(120.0, 383.0) - 120.0).abs() < 0.001);
         assert_eq!(AudioCore::clamp_seek_position(f64::NAN, 383.0), 0.0);
+    }
+
+    fn build_test_wav_bytes(sample_rate: u32, duration_secs: u32) -> Vec<u8> {
+        let num_samples = sample_rate * duration_secs;
+        let data_size = num_samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_size as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for i in 0..num_samples {
+            let sample = ((i as f32 * 0.1).sin() * 8000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn setup_core_with_headless_player(wav_bytes: Vec<u8>, duration_hint: f64) -> (AudioCore, std::thread::JoinHandle<()>) {
+        let core = AudioCore::new();
+        let (player, mut queue_rx) = Player::new();
+        let pump_handle = std::thread::spawn(move || {
+            while queue_rx.next().is_some() {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+        });
+        *core.player.lock().unwrap() = Some(player);
+        *core.cached_bytes.lock().unwrap() = Some(Arc::new(wav_bytes));
+        *core.current_duration.lock().unwrap() = duration_hint;
+        (core, pump_handle)
+    }
+
+    #[test]
+    fn test_seek_updates_state_and_failed_seek_does_not_reset_to_zero() {
+        let wav = build_test_wav_bytes(8000, 4);
+        let (core, pump) = setup_core_with_headless_player(wav.clone(), 4.0);
+
+        let st = core.seek(2.0).expect("seek to 2.0s should succeed");
+        assert!((st.position - 2.0).abs() < 0.05, "expected ~2.0, got {}", st.position);
+        assert!(!st.ended);
+
+        // Failed buffered seek (e.g., unreadable/corrupted payload) must return Err
+        // and MUST NOT reset playback position to 0.0 or clear the active player source.
+        *core.cached_bytes.lock().unwrap() = Some(Arc::new(vec![0u8; 16]));
+        let err = core.seek(3.0);
+        assert!(err.is_err(), "corrupted buffered seek should fail");
+        let after_fail = core.get_state();
+        assert!(
+            after_fail.position >= 1.95,
+            "failed seek must preserve prior position (~2.0s), got {}",
+            after_fail.position
+        );
+
+        // Failed progressive stream seek (e.g., mid-stream network error) must also preserve position
+        *core.cached_bytes.lock().unwrap() = None;
+        let load_gen = core.load_generation.load(Ordering::SeqCst);
+        let prog = Arc::new(SharedProgressive {
+            state: Mutex::new(ProgressiveBuffer {
+                data: wav[..256].to_vec(),
+                finished: true,
+                error: Some("stream reset".to_string()),
+                total_len: Some(wav.len() as u64),
+            }),
+            condvar: Condvar::new(),
+            load_gen: Arc::clone(&core.load_generation),
+        });
+        *core.active_progressive.lock().unwrap() = Some((prog, load_gen));
+        let prog_err = core.seek(3.5);
+        assert!(prog_err.is_err(), "errored progressive seek should fail");
+        assert!(
+            core.get_state().position >= 1.95,
+            "failed progressive seek must preserve prior position (~2.0s), got {}",
+            core.get_state().position
+        );
+
+        // Seek while loading must fail without resetting position to 0.0
+        *core.active_progressive.lock().unwrap() = None;
+        *core.cached_bytes.lock().unwrap() = Some(Arc::new(wav));
+        core.is_loading.store(true, Ordering::SeqCst);
+        assert!(core.seek(0.5).is_err());
+        core.is_loading.store(false, Ordering::SeqCst);
+        assert!(core.get_state().position >= 1.95);
+
+        drop(core);
+        let _ = pump.join();
+    }
+
+    #[test]
+    fn test_superseded_seek_does_not_overwrite_newer_seek() {
+        let wav = build_test_wav_bytes(8000, 4);
+        let (core, pump) = setup_core_with_headless_player(wav, 4.0);
+
+        let st_new = core.seek(3.0).expect("latest seek to 3.0s should succeed");
+        assert!((st_new.position - 3.0).abs() < 0.05);
+
+        // Simulate an older seek generation arriving late
+        let stale_gen = core.seek_generation.load(Ordering::SeqCst) - 1;
+        let stale_res = core.seek_with_gen(0.5, stale_gen);
+        assert!(stale_res.is_err());
+        let st_after = core.get_state();
+        assert!(
+            st_after.position >= 2.95,
+            "superseded seek must not overwrite position, got {}",
+            st_after.position
+        );
+
+        drop(core);
+        let _ = pump.join();
+    }
+
+    #[test]
+    fn test_progressive_reader_aborts_when_seek_superseded() {
+        let load_gen = Arc::new(AtomicU64::new(1));
+        let seek_gen = Arc::new(AtomicU64::new(1));
+        let preparing = Arc::new(AtomicBool::new(true));
+        let shared = Arc::new(SharedProgressive {
+            state: Mutex::new(ProgressiveBuffer {
+                data: vec![1u8; 64],
+                finished: false,
+                error: None,
+                total_len: Some(100_000),
+            }),
+            condvar: Condvar::new(),
+            load_gen: Arc::clone(&load_gen),
+        });
+
+        let mut reader = ProgressiveReader::new_for_seek(
+            Arc::clone(&shared),
+            1,
+            Arc::clone(&seek_gen),
+            1,
+            Arc::clone(&preparing),
+        );
+        reader.seek(SeekFrom::Start(50_000)).unwrap();
+
+        let shared_wakeup = Arc::clone(&shared);
+        let seek_gen_wakeup = Arc::clone(&seek_gen);
+        let notifier = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            seek_gen_wakeup.store(2, Ordering::SeqCst);
+            shared_wakeup.condvar.notify_all();
+        });
+
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        let res = reader.read(&mut buf);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = notifier.join();
+
+        // Once preparing is false (committed active stream), newer seek_gen must NOT interrupt reads
+        preparing.store(false, Ordering::SeqCst);
+        let mut active_reader = ProgressiveReader::new_for_seek(
+            Arc::clone(&shared),
+            1,
+            Arc::clone(&seek_gen),
+            1,
+            Arc::clone(&preparing),
+        );
+        let n = active_reader.read(&mut buf).unwrap();
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn test_visualizer_source_tracks_source_time_across_speed() {
+        let wav = Arc::new(build_test_wav_bytes(8000, 2));
+        let decoder = AudioCore::build_buffered_decoder(&wav, false).unwrap();
+        let (producer, _consumer) = rtrb::RingBuffer::new(4096);
+        let elapsed_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+        let seek_offset_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+
+        let viz = VisualizerSource::new(
+            decoder,
+            producer,
+            Arc::clone(&elapsed_bits),
+            Arc::clone(&seek_offset_bits),
+        );
+        let mut sped_up = viz.speed(2.0).track_position();
+        for _ in 0..8000 {
+            assert!(sped_up.next().is_some());
+        }
+
+        // TrackPosition sees 0.5s wall time at 2x speed, while VisualizerSource tracks 1.0s source time
+        assert!((sped_up.get_pos().as_secs_f64() - 0.5).abs() < 0.02);
+        let source_elapsed = f64::from_bits(elapsed_bits.load(Ordering::Relaxed));
+        assert!((source_elapsed - 1.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_ended_not_reported_while_seek_active() {
+        let core = AudioCore::new();
+        core.track_has_played.store(true, Ordering::SeqCst);
+        core.active_seek_count.store(1, Ordering::SeqCst);
+        let st = core.get_state();
+        assert!(!st.ended, "ended must not trigger while a seek is active");
     }
 }

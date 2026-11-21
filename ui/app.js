@@ -7433,6 +7433,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   const tvkSeekSlider = el.tvkSeekSlider || document.getElementById('tvk-seek-slider');
   const tvkTimeCur = el.tvkTimeCurrent || document.getElementById('tvk-time-current');
   if (tvkSeekSlider) {
+    let tvkSeekTimer = null;
+    let lastTvkSeekMs = 0;
+    let pendingTvkSeekTime = null;
+    const TVK_SEEK_THROTTLE_MS = 120;
+
+    const flushTvkSeek = () => {
+      if (tvkSeekTimer) {
+        clearTimeout(tvkSeekTimer);
+        tvkSeekTimer = null;
+      }
+      if (pendingTvkSeekTime !== null && el.nativeAudio && Number.isFinite(pendingTvkSeekTime)) {
+        const target = pendingTvkSeekTime;
+        pendingTvkSeekTime = null;
+        lastTvkSeekMs = performance.now();
+        safeSeekTo(target);
+      }
+    };
+
     const onTvkSeekInput = () => {
       const dur = getReliableTrackDuration();
       const frac = Math.max(0, Math.min(1, Number(tvkSeekSlider.value) / 1000));
@@ -7440,13 +7458,27 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (tvkTimeCur) tvkTimeCur.textContent = formatDuration(targetTime);
       if (el.timeCurrent) el.timeCurrent.textContent = formatDuration(targetTime);
       if (el.nativeAudio && Number.isFinite(targetTime) && dur > 0) {
-        safeSeekTo(targetTime);
+        state.scrubberDragTargetTime = targetTime;
+        pendingTvkSeekTime = targetTime;
+        const elapsed = performance.now() - lastTvkSeekMs;
+        if (elapsed >= TVK_SEEK_THROTTLE_MS) {
+          flushTvkSeek();
+        } else if (!tvkSeekTimer) {
+          tvkSeekTimer = setTimeout(flushTvkSeek, TVK_SEEK_THROTTLE_MS - elapsed);
+        }
       }
     };
     tvkSeekSlider.addEventListener('pointerdown', () => { isDraggingTvkSeek = true; });
     tvkSeekSlider.addEventListener('input', onTvkSeekInput);
-    const stopTvkSeek = () => { isDraggingTvkSeek = false; };
+    const stopTvkSeek = () => {
+      isDraggingTvkSeek = false;
+      flushTvkSeek();
+      if (!el.nativeAudio || !el.nativeAudio.seeking) {
+        state.scrubberDragTargetTime = undefined;
+      }
+    };
     tvkSeekSlider.addEventListener('pointerup', stopTvkSeek);
+    tvkSeekSlider.addEventListener('pointercancel', stopTvkSeek);
     tvkSeekSlider.addEventListener('change', stopTvkSeek);
   }
 

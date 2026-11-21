@@ -170,9 +170,11 @@
   let _currentSrc = '';
   let _isLoading = false;
   let _hasEnded = false;
+  let _isSeeking = false;
+  let _pendingSeekTarget = null;
+  let _pendingSeekOnLoad = null;
+  let _seekEpoch = 0;
   let currentLoadToken = 0;
-  let lastSeekMs = 0;
-  let lastSeekTarget = 0;
   let cachedRustFreqData = new Uint8Array(64);
   let isFetchingFreq = false;
   let lastFreqFetchMs = 0;
@@ -211,6 +213,10 @@
       set: (url) => {
         const loadToken = ++currentLoadToken;
         _currentSrc = url || '';
+        _isSeeking = false;
+        _pendingSeekTarget = null;
+        _pendingSeekOnLoad = null;
+        _seekEpoch++;
         if (!_currentSrc) {
           _isPlaying = false;
           _hasEnded = false;
@@ -286,14 +292,91 @@
             invoke('rust_audio_play').catch(() => {});
             audio.dispatchEvent(new Event('playing'));
           }
+          if (_pendingSeekOnLoad !== null) {
+            const queuedTarget = _pendingSeekOnLoad;
+            _pendingSeekOnLoad = null;
+            const clampedQueued = _currentDuration > 0 ? Math.min(queuedTarget, Math.max(0, _currentDuration - 0.1)) : queuedTarget;
+            _currentPosition = clampedQueued;
+            lastDispatchedPos = clampedQueued;
+            runSeekLoop(clampedQueued);
+          }
         }).catch((err) => {
           if (loadToken !== currentLoadToken) return;
           console.warn('[RustAudioCore] load error:', err);
           _isLoading = false;
+          _isSeeking = false;
+          _pendingSeekTarget = null;
+          _pendingSeekOnLoad = null;
+          _seekEpoch++;
           audio.dispatchEvent(new Event('error'));
         });
       }
     });
+
+    const runSeekLoop = (initialTarget) => {
+      const loadTokenAtStart = currentLoadToken;
+      _isSeeking = true;
+      _seekEpoch++;
+      audio.dispatchEvent(new Event('seeking'));
+
+      const executeSeek = (pos) => {
+        invoke('rust_audio_seek', { position: pos }).then((st) => {
+          if (loadTokenAtStart !== currentLoadToken) return;
+          if (_pendingSeekTarget !== null) {
+            const nextTarget = _pendingSeekTarget;
+            _pendingSeekTarget = null;
+            _seekEpoch++;
+            executeSeek(nextTarget);
+            return;
+          }
+          _isSeeking = false;
+          _seekEpoch++;
+          if (st && typeof st.position === 'number') {
+            _currentPosition = st.position;
+          }
+          if (st && typeof st.duration === 'number' && st.duration > 0 && st.duration !== _currentDuration) {
+            _currentDuration = st.duration;
+            audio.dispatchEvent(new Event('durationchange'));
+          }
+          if (st && typeof st.playing === 'boolean') {
+            _isPlaying = st.playing;
+          }
+          _hasEnded = !!(st && st.ended);
+          lastDispatchedPos = _currentPosition;
+          audio.dispatchEvent(new Event('seeked'));
+          audio.dispatchEvent(new Event('timeupdate'));
+        }).catch((err) => {
+          if (loadTokenAtStart !== currentLoadToken) return;
+          if (_pendingSeekTarget !== null) {
+            const nextTarget = _pendingSeekTarget;
+            _pendingSeekTarget = null;
+            _seekEpoch++;
+            executeSeek(nextTarget);
+            return;
+          }
+          console.warn('[RustAudioCore] seek error:', err);
+          _isSeeking = false;
+          _seekEpoch++;
+          const syncToken = currentLoadToken;
+          invoke('rust_audio_get_state').then((st) => {
+            if (!st || syncToken !== currentLoadToken || _isSeeking || _isLoading) return;
+            if (typeof st.position === 'number') {
+              _currentPosition = st.position;
+            }
+            _isPlaying = !!st.playing;
+            _hasEnded = !!st.ended;
+            lastDispatchedPos = _currentPosition;
+            audio.dispatchEvent(new Event('seeked'));
+            audio.dispatchEvent(new Event('timeupdate'));
+          }).catch(() => {
+            audio.dispatchEvent(new Event('seeked'));
+            audio.dispatchEvent(new Event('timeupdate'));
+          });
+        });
+      };
+
+      executeSeek(initialTarget);
+    };
 
     Object.defineProperty(audio, 'currentTime', {
       configurable: true,
@@ -304,11 +387,25 @@
         const target = _currentDuration > 0 ? Math.min(raw, Math.max(0, _currentDuration - 0.1)) : raw;
         _currentPosition = target;
         lastDispatchedPos = target;
-        lastSeekMs = performance.now();
-        lastSeekTarget = target;
         _hasEnded = false;
-        invoke('rust_audio_seek', { position: target }).catch(() => {});
-        audio.dispatchEvent(new Event('seeked'));
+
+        if (_isLoading) {
+          _pendingSeekOnLoad = target;
+          _isSeeking = true;
+          _seekEpoch++;
+          audio.dispatchEvent(new Event('seeking'));
+          audio.dispatchEvent(new Event('timeupdate'));
+          return;
+        }
+
+        if (_isSeeking) {
+          _pendingSeekTarget = target;
+          _seekEpoch++;
+          audio.dispatchEvent(new Event('timeupdate'));
+          return;
+        }
+
+        runSeekLoop(target);
         audio.dispatchEvent(new Event('timeupdate'));
       }
     });
@@ -366,7 +463,7 @@
     Object.defineProperty(audio, 'seeking', {
       configurable: true,
       enumerable: true,
-      get: () => false
+      get: () => _isSeeking
     });
 
     Object.defineProperty(audio, 'ended', {
@@ -416,24 +513,25 @@
       }
       isFetchingState = true;
       const pollToken = currentLoadToken;
+      const pollSeekEpoch = _seekEpoch;
       invoke('rust_audio_get_state').then(st => {
         if (!st || pollToken !== currentLoadToken) return;
         if (_isLoading || st.loading) {
-          _currentPosition = 0;
+          if (_pendingSeekOnLoad === null) {
+            _currentPosition = 0;
+          }
           if (typeof st.duration === 'number' && st.duration > 0 && st.duration !== _currentDuration) {
             _currentDuration = st.duration;
             audio.dispatchEvent(new Event('durationchange'));
           }
           return;
         }
+        if (_isSeeking || _pendingSeekTarget !== null || pollSeekEpoch !== _seekEpoch) {
+          return;
+        }
         const wasPlaying = _isPlaying;
         _isPlaying = !!st.playing;
-        const rawPos = typeof st.position === 'number' ? st.position : 0;
-        if (performance.now() - lastSeekMs < 350 && Math.abs(rawPos - lastSeekTarget) > 1.5) {
-          _currentPosition = lastSeekTarget;
-        } else {
-          _currentPosition = rawPos;
-        }
+        _currentPosition = typeof st.position === 'number' ? st.position : 0;
         
         if (typeof st.duration === 'number' && st.duration > 0 && st.duration !== _currentDuration) {
           _currentDuration = st.duration;

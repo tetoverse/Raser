@@ -73,8 +73,11 @@ fn rust_audio_toggle(audio_core: tauri::State<Arc<audio_core::AudioCore>>) -> Re
 }
 
 #[tauri::command]
-fn rust_audio_seek(audio_core: tauri::State<Arc<audio_core::AudioCore>>, position: f64) -> Result<(), String> {
-    audio_core.seek(position)
+async fn rust_audio_seek(
+    audio_core: tauri::State<'_, Arc<audio_core::AudioCore>>,
+    position: f64,
+) -> Result<audio_core::AudioState, String> {
+    audio_core.seek_async(position).await
 }
 
 #[tauri::command]
