@@ -1017,20 +1017,21 @@ impl RaserApp {
                 Task::none()
             }
             Message::TogglePlayPause => {
+                if self.seek_coordinator.is_loading {
+                    return Task::none();
+                }
                 if !self.queue.is_empty() {
-                    if self.seek_coordinator.is_loading && self.audio_state.url.is_none() {
-                        return Task::none();
-                    }
                     if self.current_track().is_none()
-                        || (self.audio_state.url.is_none() && !self.seek_coordinator.is_loading)
+                        || self.audio_state.url.is_none()
                         || self.audio_state.ended
+                        || self.audio_state.error.is_some()
                     {
                         if self.current_track().is_none() {
                             self.queue_index = Some(0);
                         }
                         return self.start_loading_current();
                     }
-                } else if self.audio_state.url.is_none() {
+                } else if self.audio_state.url.is_none() || self.audio_state.error.is_some() {
                     return Task::none();
                 }
                 let _ = self.audio.toggle();
