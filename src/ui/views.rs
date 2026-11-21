@@ -140,6 +140,7 @@ pub fn view_main_content<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mes
         ActiveView::Discover => view_discover(app, p),
         ActiveView::Search => view_search(app, p),
         ActiveView::Visualizer => view_visualizer(app, p),
+        ActiveView::Karaoke => crate::ui::karaoke::view_tv_karaoke(app, p),
         ActiveView::Favorites => view_favorites(app, p),
         ActiveView::Albums => view_albums(app, p),
         ActiveView::Local => view_local(app, p),
@@ -652,10 +653,13 @@ fn view_discover<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
         row![
             text(t(app.lang, "home")).size(24).color(p.on_surface),
             container(text("").size(1)).width(Length::Fill),
-            text(t(app.lang, "discover_local_hint"))
-                .size(12)
-                .color(p.outline),
+            button(text(t(app.lang, "import_spotify")).size(12))
+                .height(32)
+                .padding([0, 14])
+                .style(move |_, status| outline_pill_btn(p, false, status))
+                .on_press(Message::OpenSpotifyImportModal),
         ]
+        .spacing(10)
         .align_y(Vertical::Center),
         quick_grid,
         text(t(app.lang, "for_you")).size(16).color(p.on_surface),
@@ -2035,20 +2039,43 @@ pub fn view_right_panel<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mess
     let tabs = row![
         button(text(t(app.lang, "queue")).size(12))
             .height(32)
-            .padding([0, 14])
+            .padding([0, 12])
             .style(move |_, status| {
                 outline_pill_btn(p, app.queue_panel_tab == QueuePanelTab::Queue, status)
             })
             .on_press(Message::SelectQueuePanelTab(QueuePanelTab::Queue)),
         button(text(t(app.lang, "recent")).size(12))
             .height(32)
-            .padding([0, 14])
+            .padding([0, 12])
             .style(move |_, status| {
                 outline_pill_btn(p, app.queue_panel_tab == QueuePanelTab::Recent, status)
             })
             .on_press(Message::SelectQueuePanelTab(QueuePanelTab::Recent)),
+        button(text(t(app.lang, "lyrics")).size(12))
+            .height(32)
+            .padding([0, 12])
+            .style(move |_, status| {
+                outline_pill_btn(p, app.queue_panel_tab == QueuePanelTab::Lyrics, status)
+            })
+            .on_press(Message::SelectQueuePanelTab(QueuePanelTab::Lyrics)),
     ]
-    .spacing(8);
+    .spacing(6);
+
+    if app.queue_panel_tab == QueuePanelTab::Lyrics {
+        return container(
+            column![
+                header,
+                tabs,
+                crate::ui::karaoke::view_lyrics_pane(app, p, false),
+            ]
+            .spacing(14),
+        )
+        .width(Length::Fixed(RIGHT_PANEL_WIDTH))
+        .height(Length::Fill)
+        .padding(20)
+        .style(move |_| surface_container_style(p.surface_container_low, CORNER_XL))
+        .into();
+    }
 
     let items: Vec<(usize, TrackRecord)> = match app.queue_panel_tab {
         QueuePanelTab::Queue => app.queue.iter().cloned().enumerate().take(50).collect(),
@@ -2060,6 +2087,7 @@ pub fn view_right_panel<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mess
             .enumerate()
             .take(50)
             .collect(),
+        QueuePanelTab::Lyrics => Vec::new(),
     };
 
     let mut list_col = column![].spacing(4);
@@ -2071,6 +2099,7 @@ pub fn view_right_panel<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mess
         let msg = match app.queue_panel_tab {
             QueuePanelTab::Queue => Message::JumpToQueueIndex(idx),
             QueuePanelTab::Recent => Message::PlayTracks(vec![tr.clone()], 0),
+            QueuePanelTab::Lyrics => Message::Noop,
         };
         list_col = list_col.push(
             button(
@@ -2316,6 +2345,73 @@ pub fn view_modal<'a>(
             ]
             .spacing(14)
             .into()
+        }
+
+        ModalState::SyncLyrics {
+            sync_lines,
+            stamped_times,
+            current_idx,
+            is_syncing,
+            ..
+        } => crate::ui::karaoke::view_sync_editor_content(
+            app,
+            p,
+            &app.sync_editor_content,
+            sync_lines,
+            stamped_times,
+            *current_idx,
+            *is_syncing,
+        ),
+
+        ModalState::SpotifyImport {
+            url_input,
+            token_input,
+            status,
+            loading,
+        } => {
+            let mut col = column![
+                text(t(app.lang, "import_spotify"))
+                    .size(18)
+                    .color(p.on_surface),
+                text_input(t(app.lang, "spotify_url_placeholder"), url_input)
+                    .on_input(Message::ModalSpotifyUrlChanged)
+                    .padding([12, 16])
+                    .style(move |_, st| modal_input_style(p, st)),
+                text_input("Optional OAuth Bearer Token", token_input)
+                    .on_input(Message::ModalSpotifyTokenChanged)
+                    .padding([10, 14])
+                    .style(move |_, st| modal_input_style(p, st)),
+                button(text(t(app.lang, "spotify_gdpr_btn")).size(12))
+                    .height(34)
+                    .padding([0, 14])
+                    .style(move |_, st| outline_pill_btn(p, false, st))
+                    .on_press(Message::PickSpotifyGdprJson),
+            ]
+            .spacing(12);
+
+            if *loading {
+                col = col.push(text(t(app.lang, "importing")).size(12).color(p.primary));
+            } else if let Some(msg) = status {
+                col = col.push(text(msg).size(12).color(p.error));
+            }
+
+            col = col.push(
+                row![
+                    container(text("").size(1)).width(Length::Fill),
+                    button(text(t(app.lang, "cancel")).size(13))
+                        .height(38)
+                        .padding([0, 18])
+                        .style(move |_, st| outline_pill_btn(p, false, st))
+                        .on_press(Message::CloseModal),
+                    button(text(t(app.lang, "import_btn")).size(13))
+                        .height(38)
+                        .padding([0, 20])
+                        .style(move |_, st| pill_primary_btn(p, st))
+                        .on_press(Message::SubmitSpotifyImportUrl),
+                ]
+                .spacing(8),
+            );
+            col.into()
         }
     };
 

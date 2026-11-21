@@ -677,8 +677,25 @@ pub fn view_playbar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
     )
     .style(move |_| surface_container_style(p.surface_container_high, 8.0));
 
+    let karaoke_active = matches!(app.active_view, ActiveView::Karaoke);
+    let karaoke_btn = tooltip(
+        button(text("TV").size(11).color(if karaoke_active {
+            p.on_primary
+        } else {
+            p.on_surface_variant
+        }))
+        .width(34)
+        .height(34)
+        .padding(0)
+        .style(move |_, status| icon_pill_btn(p, karaoke_active, status))
+        .on_press(Message::ToggleKaraokeMode),
+        text(t(app.lang, "karaoke_mode")).size(11).color(p.on_surface),
+        tooltip::Position::Top,
+    )
+    .style(move |_| surface_container_style(p.surface_container_high, 8.0));
+
     let right_panel = container(
-        row![vis_btn, queue_btn, speed_btn, mute_btn, vol_slider, vol_pct]
+        row![vis_btn, karaoke_btn, queue_btn, speed_btn, mute_btn, vol_slider, vol_pct]
             .spacing(8)
             .align_y(Vertical::Center),
     )
@@ -766,14 +783,27 @@ pub fn view_mini_player<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Mess
     .align_x(Alignment::Center);
 
     let playbar = view_playbar(app, p);
+    let mut main_area = column![cover, meta, button(text(t(app.lang, "lyrics")).size(12))
+        .height(30)
+        .padding([0, 14])
+        .style(move |_, status| crate::ui::outline_pill_btn(p, app.mini_lyrics_open, status))
+        .on_press(Message::ToggleMiniLyrics)]
+    .spacing(12)
+    .align_x(Alignment::Center);
+
+    if app.mini_lyrics_open {
+        main_area = main_area.push(
+            container(crate::ui::karaoke::view_lyrics_pane(app, p, true))
+                .width(Length::Fill)
+                .height(Length::Fixed(150.0))
+                .padding([8, 12])
+                .style(move |_| surface_container_style(p.surface_container, CORNER_M)),
+        );
+    }
 
     container(
         column![
-            container(
-                column![cover, meta]
-                    .spacing(16)
-                    .align_x(Alignment::Center)
-            )
+            container(main_area)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(Alignment::Center)

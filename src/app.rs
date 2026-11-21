@@ -1,8 +1,10 @@
 use crate::audio_core::{AudioCore, AudioState};
 use crate::discord::{self, DiscordTrackInfo};
 use crate::i18n::{detect_os_lang, Lang};
+use crate::import;
 use crate::integrations::{hotkeys::HotkeyController, memory, tray::TrayController};
 use crate::local_files;
+use crate::lyrics::{self, ParsedLyrics};
 use crate::providers::{
     self, AlbumDetail, ArtistDetail, AudioQuality, DiscoverFeed, Platform, ResolvedStream,
 };
@@ -18,12 +20,12 @@ use crate::ui::visualizer::{
     self, M3CoverShape, FFT_BINS, HOLD_MS, MORPH_MS,
 };
 use crate::ui::{
-    playbar, sidebar, titlebar, views, M3Palette, CORNER_XL, SIDEBAR_CLASSIC_WIDTH,
+    karaoke, playbar, sidebar, titlebar, views, M3Palette, CORNER_XL, SIDEBAR_CLASSIC_WIDTH,
 };
 use crate::updater::{self, UpdateInfo};
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::mouse;
-use iced::widget::{column, container, operation, row, stack};
+use iced::widget::{column, container, operation, row, stack, text_editor};
 use iced::window;
 use iced::{Background, Element, Event, Length, Padding, Size, Subscription, Task, Theme};
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ pub enum ActiveView {
     Discover,
     Search,
     Visualizer,
+    Karaoke,
     Favorites,
     Albums,
     Local,
@@ -60,6 +63,7 @@ pub enum SettingsTab {
 pub enum QueuePanelTab {
     Queue,
     Recent,
+    Lyrics,
 }
 
 #[derive(Debug, Clone)]
@@ -86,11 +90,28 @@ pub enum ModalState {
     AddToPlaylist {
         track: TrackRecord,
     },
+    SyncLyrics {
+        track: TrackRecord,
+        sync_lines: Vec<String>,
+        stamped_times: Vec<Option<f64>>,
+        current_idx: usize,
+        is_syncing: bool,
+    },
+    SpotifyImport {
+        url_input: String,
+        token_input: String,
+        status: Option<String>,
+        loading: bool,
+    },
 }
 
 impl ModalState {
     pub fn has_text_input(&self) -> bool {
-        !matches!(self, ModalState::AddToPlaylist { .. })
+        match self {
+            ModalState::AddToPlaylist { .. } => false,
+            ModalState::SyncLyrics { is_syncing, .. } => !*is_syncing,
+            _ => true,
+        }
     }
 }
 
@@ -106,6 +127,7 @@ pub fn parse_view_flag(val: &str) -> Option<ActiveView> {
         "discover" | "home" => Some(ActiveView::Discover),
         "search" => Some(ActiveView::Search),
         "visualizer" => Some(ActiveView::Visualizer),
+        "karaoke" => Some(ActiveView::Karaoke),
         "favorites" | "favs" => Some(ActiveView::Favorites),
         "albums" => Some(ActiveView::Albums),
         "local" => Some(ActiveView::Local),
@@ -311,6 +333,7 @@ pub enum ShortcutAction {
     CycleRepeat,
     ToggleMiniPlayer,
     ToggleFullscreen,
+    ToggleKaraoke,
     FocusSearch,
     EscapeUnwind,
     EmergencyThemeReset,
@@ -368,6 +391,7 @@ pub fn resolve_shortcut(
             "h" => Some(ShortcutAction::ToggleShuffle),
             "r" => Some(ShortcutAction::CycleRepeat),
             "p" => Some(ShortcutAction::ToggleMiniPlayer),
+            "f" => Some(ShortcutAction::ToggleKaraoke),
             _ => None,
         },
         _ => None,
@@ -445,6 +469,27 @@ pub enum Message {
     ToggleMinimizeToTray,
     ShowFromTray,
     QuitApp,
+
+    FetchCurrentLyrics,
+    LyricsFetched(String, Result<ParsedLyrics, String>),
+    ToggleKaraokeMode,
+    CloseKaraoke,
+    ToggleKaraokeSettings,
+    ToggleKaraokeVisualizer,
+    ToggleMiniLyrics,
+    AdjustLyricsOffset(i64),
+    OpenSyncLyricsModal,
+    ModalSyncEditorAction(text_editor::Action),
+    StartSyncTapMode,
+    SyncStampCurrentLine,
+    SubmitSyncLyrics,
+    OpenSpotifyImportModal,
+    ModalSpotifyUrlChanged(String),
+    ModalSpotifyTokenChanged(String),
+    SubmitSpotifyImportUrl,
+    PickSpotifyGdprJson,
+    SpotifyGdprFileLoaded(Result<(String, Vec<TrackRecord>), String>),
+    SpotifyUrlImportFinished(Result<(String, Vec<TrackRecord>), String>),
 
     PlayTracks(Vec<TrackRecord>, usize),
     PlayPlaylist(String),
@@ -587,6 +632,15 @@ pub struct RaserApp {
     pub last_trim_at: Instant,
     pub last_discord_playing: Option<bool>,
     pub last_discord_cid: Option<String>,
+
+    pub current_lyrics: Option<ParsedLyrics>,
+    pub lyrics_loading: bool,
+    pub lyrics_track_key: Option<String>,
+    pub lyrics_user_offset_ms: i64,
+    pub karaoke_settings_open: bool,
+    pub karaoke_show_visualizer: bool,
+    pub mini_lyrics_open: bool,
+    pub sync_editor_content: text_editor::Content,
 }
 
 impl RaserApp {
@@ -683,6 +737,14 @@ impl RaserApp {
             last_trim_at: Instant::now(),
             last_discord_playing: None,
             last_discord_cid: None,
+            current_lyrics: None,
+            lyrics_loading: false,
+            lyrics_track_key: None,
+            lyrics_user_offset_ms: 0,
+            karaoke_settings_open: false,
+            karaoke_show_visualizer: true,
+            mini_lyrics_open: false,
+            sync_editor_content: text_editor::Content::new(),
         };
 
         (app, window::oldest().map(Message::WindowOpened))
@@ -1006,7 +1068,8 @@ impl RaserApp {
             move |res| Message::AudioLoadFinished(my_load_epoch, res),
         );
         let cover_task = self.maybe_fetch_cover_task(tr);
-        Task::batch([load_task, cover_task])
+        let lyrics_task = self.update(Message::FetchCurrentLyrics);
+        Task::batch([load_task, cover_task, lyrics_task])
     }
 
     fn start_loading_current(&mut self) -> Task<Message> {
@@ -1165,11 +1228,18 @@ impl RaserApp {
             ShortcutAction::CycleRepeat => self.update(Message::CycleRepeat),
             ShortcutAction::ToggleMiniPlayer => self.update(Message::ToggleMiniPlayer),
             ShortcutAction::ToggleFullscreen => self.update(Message::ToggleFullscreen),
+            ShortcutAction::ToggleKaraoke => self.update(Message::ToggleKaraokeMode),
             ShortcutAction::FocusSearch => self.update(Message::FocusSearchBox),
             ShortcutAction::EmergencyThemeReset => self.update(Message::ResetThemeEmergency),
             ShortcutAction::EscapeUnwind => {
                 if self.modal.is_some() {
                     self.modal = None;
+                    Task::none()
+                } else if self.karaoke_settings_open {
+                    self.karaoke_settings_open = false;
+                    Task::none()
+                } else if matches!(self.active_view, ActiveView::Karaoke) {
+                    self.navigate_back();
                     Task::none()
                 } else if self.search_focused {
                     self.unfocus_search()
@@ -1299,6 +1369,334 @@ impl RaserApp {
                 self.snapshot.save();
                 discord::clear_presence();
                 iced::exit()
+            }
+            Message::FetchCurrentLyrics => {
+                let Some(tr) = self.current_track() else {
+                    self.current_lyrics = None;
+                    self.lyrics_loading = false;
+                    return Task::none();
+                };
+                let cid = tr.canonical_id();
+                if self.lyrics_track_key.as_deref() == Some(cid.as_str())
+                    && (self.lyrics_loading || self.current_lyrics.is_some())
+                {
+                    return Task::none();
+                }
+                self.lyrics_track_key = Some(cid.clone());
+                self.lyrics_loading = true;
+                self.current_lyrics = None;
+                self.lyrics_user_offset_ms = 0;
+                let Ok(client) = self.http_client() else {
+                    self.lyrics_loading = false;
+                    return Task::none();
+                };
+                Task::perform(
+                    async move { lyrics::fetch_lyrics_for_track(&client, &tr).await },
+                    move |res| Message::LyricsFetched(cid, res),
+                )
+            }
+            Message::LyricsFetched(cid, res) => {
+                if self.lyrics_track_key.as_deref() == Some(cid.as_str()) {
+                    self.lyrics_loading = false;
+                    if let Ok(parsed) = res {
+                        self.current_lyrics = Some(parsed);
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleKaraokeMode => {
+                if matches!(self.active_view, ActiveView::Karaoke) {
+                    self.navigate_back();
+                    Task::none()
+                } else {
+                    let sw = self.switch_view(ActiveView::Karaoke);
+                    let f = self.update(Message::FetchCurrentLyrics);
+                    Task::batch([sw, f])
+                }
+            }
+            Message::CloseKaraoke => {
+                if self.karaoke_settings_open {
+                    self.karaoke_settings_open = false;
+                }
+                if matches!(self.active_view, ActiveView::Karaoke) {
+                    self.navigate_back();
+                }
+                Task::none()
+            }
+            Message::ToggleKaraokeSettings => {
+                self.karaoke_settings_open = !self.karaoke_settings_open;
+                Task::none()
+            }
+            Message::ToggleKaraokeVisualizer => {
+                self.karaoke_show_visualizer = !self.karaoke_show_visualizer;
+                Task::none()
+            }
+            Message::ToggleMiniLyrics => {
+                self.mini_lyrics_open = !self.mini_lyrics_open;
+                if self.mini_lyrics_open {
+                    return self.update(Message::FetchCurrentLyrics);
+                }
+                Task::none()
+            }
+            Message::AdjustLyricsOffset(delta_ms) => {
+                self.lyrics_user_offset_ms = (self.lyrics_user_offset_ms + delta_ms).clamp(-15000, 15000);
+                Task::none()
+            }
+            Message::OpenSyncLyricsModal => {
+                let Some(tr) = self.current_track() else {
+                    return Task::none();
+                };
+                let initial = self
+                    .current_lyrics
+                    .as_ref()
+                    .map(|l| l.plain_text.clone())
+                    .unwrap_or_default();
+                self.sync_editor_content = text_editor::Content::with_text(&initial);
+                self.modal = Some(ModalState::SyncLyrics {
+                    track: tr,
+                    sync_lines: Vec::new(),
+                    stamped_times: Vec::new(),
+                    current_idx: 0,
+                    is_syncing: false,
+                });
+                self.unfocus_search()
+            }
+            Message::ModalSyncEditorAction(action) => {
+                self.sync_editor_content.perform(action);
+                Task::none()
+            }
+            Message::StartSyncTapMode => {
+                let raw = self.sync_editor_content.text();
+                let parsed_existing = lyrics::parse_lrc(&raw);
+                let lines: Vec<String> = if !parsed_existing.lines.is_empty() {
+                    parsed_existing
+                        .lines
+                        .into_iter()
+                        .filter(|l| !l.is_interlude)
+                        .map(|l| l.text)
+                        .collect()
+                } else {
+                    raw.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                };
+                if lines.is_empty() {
+                    return Task::none();
+                }
+                let count = lines.len();
+                if let Some(ModalState::SyncLyrics {
+                    sync_lines,
+                    stamped_times,
+                    current_idx,
+                    is_syncing,
+                    ..
+                }) = &mut self.modal
+                {
+                    *sync_lines = lines;
+                    *stamped_times = vec![None; count];
+                    *current_idx = 0;
+                    *is_syncing = true;
+                }
+                Task::none()
+            }
+            Message::SyncStampCurrentLine => {
+                let pos = self.displayed_position();
+                if let Some(ModalState::SyncLyrics {
+                    sync_lines,
+                    stamped_times,
+                    current_idx,
+                    is_syncing: true,
+                    ..
+                }) = &mut self.modal
+                {
+                    if *current_idx < sync_lines.len() {
+                        stamped_times[*current_idx] = Some(pos);
+                        if *current_idx + 1 < sync_lines.len() {
+                            *current_idx += 1;
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SubmitSyncLyrics => {
+                let raw = self.sync_editor_content.text();
+                if let Some(ModalState::SyncLyrics {
+                    track,
+                    sync_lines,
+                    stamped_times,
+                    is_syncing,
+                    ..
+                }) = self.modal.take()
+                {
+                    let final_lrc = if is_syncing && !sync_lines.is_empty() {
+                        let lrc_lines: Vec<lyrics::LyricLine> = sync_lines
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, text)| {
+                                let ts = stamped_times.get(i).and_then(|o| *o)?;
+                                Some(lyrics::LyricLine {
+                                    time_secs: ts,
+                                    text: text.clone(),
+                                    words: Vec::new(),
+                                    is_instrumental: false,
+                                    is_interlude: false,
+                                })
+                            })
+                            .collect();
+                        lyrics::serialize_lrc(&lrc_lines, 0)
+                    } else {
+                        raw
+                    };
+                    let key = if !track.id.trim().is_empty() {
+                        track.id.clone()
+                    } else {
+                        track.canonical_id()
+                    };
+                    let parsed = lyrics::parse_lrc(&final_lrc);
+                    let rec = lyrics::CachedLyricsRecord {
+                        raw_lrc: final_lrc,
+                        plain_text: parsed.plain_text.clone(),
+                        intro_offset_secs: 0.0,
+                        source: "custom".to_string(),
+                    };
+                    if let Ok(s) = serde_json::to_string(&rec) {
+                        storage::save_cached_lyrics(&key, &s);
+                    }
+                    self.current_lyrics = Some(parsed);
+                    self.lyrics_track_key = Some(track.canonical_id());
+                }
+                Task::none()
+            }
+            Message::OpenSpotifyImportModal => {
+                self.modal = Some(ModalState::SpotifyImport {
+                    url_input: String::new(),
+                    token_input: String::new(),
+                    status: None,
+                    loading: false,
+                });
+                self.unfocus_search()
+            }
+            Message::ModalSpotifyUrlChanged(v) => {
+                if let Some(ModalState::SpotifyImport { url_input, .. }) = &mut self.modal {
+                    *url_input = v;
+                }
+                Task::none()
+            }
+            Message::ModalSpotifyTokenChanged(v) => {
+                if let Some(ModalState::SpotifyImport { token_input, .. }) = &mut self.modal {
+                    *token_input = v;
+                }
+                Task::none()
+            }
+            Message::SubmitSpotifyImportUrl => {
+                let (url_in, tok_in) = match &mut self.modal {
+                    Some(ModalState::SpotifyImport {
+                        url_input,
+                        token_input,
+                        loading,
+                        status,
+                    }) => {
+                        if *loading || url_input.trim().is_empty() {
+                            return Task::none();
+                        }
+                        *loading = true;
+                        *status = None;
+                        (url_input.trim().to_string(), token_input.trim().to_string())
+                    }
+                    _ => return Task::none(),
+                };
+                let Ok(client) = self.http_client() else {
+                    return Task::none();
+                };
+                let plat = self.search_platform;
+                Task::perform(
+                    async move {
+                        let tok = if tok_in.is_empty() {
+                            None
+                        } else {
+                            Some(tok_in.as_str())
+                        };
+                        let pl = import::fetch_spotify_playlist(&client, &url_in, tok).await?;
+                        let matched = import::match_imported_tracks(&client, &pl.tracks, plat).await;
+                        let records: Vec<TrackRecord> =
+                            matched.into_iter().map(TrackRecord::from).collect();
+                        Ok((pl.name, records))
+                    },
+                    Message::SpotifyUrlImportFinished,
+                )
+            }
+            Message::PickSpotifyGdprJson => {
+                let Ok(client) = self.http_client() else {
+                    return Task::none();
+                };
+                let plat = self.search_platform;
+                if let Some(ModalState::SpotifyImport { loading, status, .. }) = &mut self.modal {
+                    *loading = true;
+                    *status = None;
+                }
+                Task::perform(
+                    async move {
+                        let file = rfd::AsyncFileDialog::new()
+                            .add_filter("Spotify JSON", &["json"])
+                            .pick_file()
+                            .await
+                            .ok_or_else(|| "Cancelled".to_string())?;
+                        let raw = std::fs::read_to_string(file.path())
+                            .map_err(|e| e.to_string())?;
+                        let pls = import::parse_spotify_gdpr_json(&raw)?;
+                        let first = pls.into_iter().next().ok_or_else(|| "Empty JSON".to_string())?;
+                        let matched =
+                            import::match_imported_tracks(&client, &first.tracks, plat).await;
+                        let records: Vec<TrackRecord> =
+                            matched.into_iter().map(TrackRecord::from).collect();
+                        Ok((first.name, records))
+                    },
+                    Message::SpotifyGdprFileLoaded,
+                )
+            }
+            Message::SpotifyGdprFileLoaded(res) | Message::SpotifyUrlImportFinished(res) => {
+                match res {
+                    Ok((name, tracks)) => {
+                        if tracks.is_empty() {
+                            if let Some(ModalState::SpotifyImport { loading, status, .. }) =
+                                &mut self.modal
+                            {
+                                *loading = false;
+                                *status = Some("No matching tracks found.".to_string());
+                            }
+                            return Task::none();
+                        }
+                        let id = format!("pl_{}", now_millis());
+                        self.snapshot.playlists.push(PlaylistRecord {
+                            id: id.clone(),
+                            name,
+                            description: Some("Imported from Spotify".to_string()),
+                            cover: tracks.first().and_then(|t| {
+                                if t.thumbnail.is_empty() {
+                                    None
+                                } else {
+                                    Some(t.thumbnail.clone())
+                                }
+                            }),
+                            tracks,
+                            sort_mode: None,
+                            extra: HashMap::new(),
+                        });
+                        self.snapshot.save();
+                        self.modal = None;
+                        return self.switch_view(ActiveView::PlaylistDetail(id));
+                    }
+                    Err(e) => {
+                        if let Some(ModalState::SpotifyImport { loading, status, .. }) =
+                            &mut self.modal
+                        {
+                            *loading = false;
+                            *status = Some(e);
+                        }
+                    }
+                }
+                Task::none()
             }
             Message::ToggleMiniPlayer => {
                 self.is_mini_player = !self.is_mini_player;
@@ -2490,6 +2888,16 @@ impl RaserApp {
             }
             Message::SystemEvent(ev) => match ev {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    if matches!(
+                        self.modal,
+                        Some(ModalState::SyncLyrics {
+                            is_syncing: true,
+                            ..
+                        })
+                    ) && matches!(key, Key::Named(Named::Space))
+                    {
+                        return self.update(Message::SyncStampCurrentLine);
+                    }
                     let modal_open = self.modal.is_some();
                     let input_focused = self.search_focused
                         || self.modal.as_ref().map(|m| m.has_text_input()).unwrap_or(false);
@@ -2531,6 +2939,10 @@ impl RaserApp {
 
     pub fn view(&self) -> Element<'_, Message> {
         let p = self.palette();
+
+        if matches!(self.active_view, ActiveView::Karaoke) && self.modal.is_none() {
+            return karaoke::view_tv_karaoke(self, p);
+        }
 
         let base_shell: Element<'_, Message> = if self.is_mini_player {
             column![
