@@ -2,6 +2,7 @@ pub mod playbar;
 pub mod sidebar;
 pub mod titlebar;
 pub mod views;
+pub mod visualizer;
 
 use iced::widget::{button, container, slider, svg, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
