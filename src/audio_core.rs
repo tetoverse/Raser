@@ -959,6 +959,24 @@ impl AudioCore {
         Ok(self.get_state())
     }
 
+    fn mark_load_failed(&self, my_gen: u64, err: &str) {
+        if self.load_generation.load(Ordering::SeqCst) == my_gen {
+            self.is_playing.store(false, Ordering::SeqCst);
+            self.is_loading.store(false, Ordering::SeqCst);
+            *self.current_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.cached_bytes.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Some((old_prog, _)) = self
+                .active_progressive
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                old_prog.condvar.notify_all();
+            }
+            *self.current_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+        }
+    }
+
     pub async fn load_audio_async(
         self: &Arc<Self>,
         url: String,
@@ -1018,7 +1036,7 @@ impl AudioCore {
             .map(String::from)
             .or_else(|| extract_track_id_from_url(&url));
 
-        tokio::task::spawn_blocking(move || {
+        let spawn_result = tokio::task::spawn_blocking(move || {
             let mut cached_bytes_opt = None;
             if let Some(ref tid) = effective_tid {
                 if let Some(cached_path) = storage::get_cached_audio_path(tid) {
@@ -1039,7 +1057,10 @@ impl AudioCore {
                 AudioSourceKind::RemoteHttp(remote_url) if cached_bytes_opt.is_none() => {
                 let client = match shared_http_client() {
                     Ok(c) => c,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        this.mark_load_failed(current_gen, &e);
+                        return Err(e);
+                    }
                 };
 
                 let resp = match client.get(&remote_url).send() {
@@ -1047,9 +1068,7 @@ impl AudioCore {
                     Err(e) => {
                         let err_msg = format!("Failed to fetch stream URL: {:?}", e);
                         log::error!("Audio load failed for {}: {}", url, err_msg);
-                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                        this.is_loading.store(false, Ordering::SeqCst);
-                        this.is_playing.store(false, Ordering::SeqCst);
+                        this.mark_load_failed(current_gen, &err_msg);
                         return Err(err_msg);
                     }
                 };
@@ -1061,9 +1080,7 @@ impl AudioCore {
                         resp.status().canonical_reason().unwrap_or("Failed")
                     );
                     log::error!("Audio load failed for {}: {}", url, err_msg);
-                    *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                    this.is_loading.store(false, Ordering::SeqCst);
-                    this.is_playing.store(false, Ordering::SeqCst);
+                    this.mark_load_failed(current_gen, &err_msg);
                     return Err(err_msg);
                 }
 
@@ -1170,17 +1187,14 @@ impl AudioCore {
                             .clone()
                             .unwrap_or_else(|| "Empty stream response".to_string());
                         log::error!("Audio load failed for {}: {}", url, err_msg);
-                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                        this.is_loading.store(false, Ordering::SeqCst);
-                        this.is_playing.store(false, Ordering::SeqCst);
+                        this.mark_load_failed(current_gen, &err_msg);
                         return Err(err_msg);
                     }
                 }
 
                 if let Err(e) = this.ensure_player() {
                     log::error!("Error ensuring audio player: {:?}", e);
-                    *this.current_error.lock().unwrap() = Some(e.clone());
-                    this.is_loading.store(false, Ordering::SeqCst);
+                    this.mark_load_failed(current_gen, &e);
                     return Err(e);
                 }
 
@@ -1190,8 +1204,7 @@ impl AudioCore {
                     Err(e) => {
                         let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
                         log::error!("{}", err_msg);
-                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                        this.is_loading.store(false, Ordering::SeqCst);
+                        this.mark_load_failed(current_gen, &err_msg);
                         return Err(err_msg);
                     }
                 };
@@ -1223,9 +1236,7 @@ impl AudioCore {
                     Ok(b) => b,
                     Err(err_msg) => {
                         log::error!("Audio load failed for {}: {}", url, err_msg);
-                        *this.current_error.lock().unwrap() = Some(err_msg.clone());
-                        this.is_loading.store(false, Ordering::SeqCst);
-                        this.is_playing.store(false, Ordering::SeqCst);
+                        this.mark_load_failed(current_gen, &err_msg);
                         return Err(err_msg);
                     }
                 };
@@ -1235,8 +1246,7 @@ impl AudioCore {
 
                 if let Err(e) = this.ensure_player() {
                     log::error!("Error ensuring audio player: {:?}", e);
-                    *this.current_error.lock().unwrap() = Some(e.clone());
-                    this.is_loading.store(false, Ordering::SeqCst);
+                    this.mark_load_failed(current_gen, &e);
                     return Err(e);
                 }
 
@@ -1245,8 +1255,7 @@ impl AudioCore {
                     Err(e) => {
                         let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
                         log::error!("{}", err_msg);
-                        *this.current_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err_msg.clone());
-                        this.is_loading.store(false, Ordering::SeqCst);
+                        this.mark_load_failed(current_gen, &err_msg);
                         return Err(err_msg);
                     }
                 };
@@ -1273,8 +1282,18 @@ impl AudioCore {
                         if decoder.try_seek(target_start).is_ok() {
                             initial_offset = clamped_start;
                             LoadedDecoder::Buffered(decoder)
-                        } else if let Ok(fresh) = Self::build_buffered_decoder(&this.cached_bytes.lock().unwrap_or_else(|e| e.into_inner()).as_ref().unwrap(), false) {
-                            LoadedDecoder::Buffered(fresh)
+                        } else if let Some(cached) = this
+                            .cached_bytes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .cloned()
+                        {
+                            if let Ok(fresh) = Self::build_buffered_decoder(&cached, false) {
+                                LoadedDecoder::Buffered(fresh)
+                            } else {
+                                LoadedDecoder::Buffered(decoder)
+                            }
                         } else {
                             LoadedDecoder::Buffered(decoder)
                         }
@@ -1348,8 +1367,16 @@ impl AudioCore {
 
             Ok(this.get_state())
         })
-        .await
-        .map_err(|e| format!("Task execution error: {:?}", e))?
+        .await;
+
+        match spawn_result {
+            Ok(res) => res,
+            Err(e) => {
+                let err_msg = format!("Task execution error: {:?}", e);
+                self.mark_load_failed(current_gen, &err_msg);
+                Err(err_msg)
+            }
+        }
     }
 
     pub fn get_state(&self) -> AudioState {
