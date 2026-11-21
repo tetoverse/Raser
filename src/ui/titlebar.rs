@@ -5,7 +5,7 @@ use crate::ui::{
     ICON_FULLSCREEN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_MINI_PLAYER, TITLEBAR_HEIGHT,
 };
 use iced::alignment::Vertical;
-use iced::widget::{button, container, mouse_area, row, text, tooltip};
+use iced::widget::{button, container, mouse_area, row, stack, text, tooltip};
 use iced::{Alignment, Element, Length};
 
 pub fn view_titlebar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
@@ -86,9 +86,18 @@ pub fn view_titlebar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message
     .align_y(Vertical::Center);
 
     let bar = container(
-        row![drag_region, controls]
+        stack![
+            drag_region,
+            row![
+                container(text("").size(1)).width(Length::Fill),
+                controls,
+            ]
+            .height(Length::Fixed(TITLEBAR_HEIGHT))
             .align_y(Vertical::Center)
             .padding([0, 16]),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fixed(TITLEBAR_HEIGHT)),
     )
     .width(Length::Fill)
     .height(Length::Fixed(TITLEBAR_HEIGHT))

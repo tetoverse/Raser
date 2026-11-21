@@ -44,7 +44,7 @@ pub fn view_top_nav<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
         .align_y(Vertical::Center)
         .style(move |_| surface_container_style(p.surface_container, 9999.0)),
     )
-    .on_press(Message::SearchFocused(true));
+    .on_press(Message::FocusSearchBox);
 
     let mut search_row = row![search_bar].align_y(Vertical::Center);
     if !app.search_query.is_empty() {
@@ -733,14 +733,16 @@ fn view_albums<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message> {
 
     let mut cards = row![].spacing(16);
     for album in app.snapshot.saved_albums.iter().take(12) {
-        let title = album
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Album");
-        let artist = album
-            .get("artist")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Artist");
+        let title = if album.title.trim().is_empty() {
+            "Album"
+        } else {
+            album.title.as_str()
+        };
+        let artist = if album.artist.trim().is_empty() {
+            "Artist"
+        } else {
+            album.artist.as_str()
+        };
         cards = cards.push(
             container(
                 column![

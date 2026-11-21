@@ -1,7 +1,7 @@
 use crate::storage;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -12,11 +12,24 @@ pub enum AudioSourceKind {
     LocalPath(PathBuf),
 }
 
-fn decode_local_path_string(raw: &str) -> PathBuf {
-    let decoded = urlencoding::decode(raw)
-        .map(|c| c.into_owned())
-        .unwrap_or_else(|_| raw.to_string());
-    let mut s = decoded;
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() {
+        let head = &s.as_bytes()[..prefix.len()];
+        if head.eq_ignore_ascii_case(prefix.as_bytes()) {
+            return Some(&s[prefix.len()..]);
+        }
+    }
+    None
+}
+
+fn decode_local_path_string(raw: &str, decode_percent: bool) -> PathBuf {
+    let mut s = if decode_percent {
+        urlencoding::decode(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string())
+    } else {
+        raw.to_string()
+    };
     if let Some(stripped) = s.strip_prefix(r"\\?\") {
         s = stripped.to_string();
     } else if let Some(stripped) = s.strip_prefix("//?/") {
@@ -38,17 +51,18 @@ fn decode_local_path_string(raw: &str) -> PathBuf {
 /// before generic `http(s)://` so saved v1.2.6 local tracks are read from disk.
 pub fn normalize_audio_url(raw: &str) -> AudioSourceKind {
     let trimmed = raw.trim();
-    if let Some(rest) = trimmed
-        .strip_prefix("http://asset.localhost/")
-        .or_else(|| trimmed.strip_prefix("https://asset.localhost/"))
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "http://asset.localhost/")
+        .or_else(|| strip_prefix_ignore_ascii_case(trimmed, "https://asset.localhost/"))
     {
-        return AudioSourceKind::LocalPath(decode_local_path_string(rest));
+        return AudioSourceKind::LocalPath(decode_local_path_string(rest, true));
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if strip_prefix_ignore_ascii_case(trimmed, "http://").is_some()
+        || strip_prefix_ignore_ascii_case(trimmed, "https://").is_some()
+    {
         return AudioSourceKind::RemoteHttp(trimmed.to_string());
     }
-    if let Some(rest) = trimmed.strip_prefix("file:///") {
-        let mut p = decode_local_path_string(rest);
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "file:///") {
+        let mut p = decode_local_path_string(rest, true);
         if !cfg!(windows) {
             let s = p.to_string_lossy();
             if !s.starts_with('/') {
@@ -57,15 +71,13 @@ pub fn normalize_audio_url(raw: &str) -> AudioSourceKind {
         }
         return AudioSourceKind::LocalPath(p);
     }
-    if let Some(rest) = trimmed.strip_prefix("file://") {
-        let rest = rest.strip_prefix("localhost/").map(|s| format!("/{}", s)).unwrap_or_else(|| rest.to_string());
-        return AudioSourceKind::LocalPath(decode_local_path_string(&rest));
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "file://") {
+        let rest = strip_prefix_ignore_ascii_case(rest, "localhost/")
+            .map(|s| format!("/{}", s))
+            .unwrap_or_else(|| rest.to_string());
+        return AudioSourceKind::LocalPath(decode_local_path_string(&rest, true));
     }
-    let direct = Path::new(trimmed);
-    if direct.exists() {
-        return AudioSourceKind::LocalPath(direct.to_path_buf());
-    }
-    AudioSourceKind::LocalPath(decode_local_path_string(trimmed))
+    AudioSourceKind::LocalPath(decode_local_path_string(trimmed, false))
 }
 
 use rodio::decoder::Decoder;
@@ -571,6 +583,41 @@ impl AudioCore {
             player.pause();
         }
         Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.load_generation.fetch_add(1, Ordering::SeqCst);
+        self.is_playing.store(false, Ordering::SeqCst);
+        self.is_loading.store(false, Ordering::SeqCst);
+        self.has_ended.store(false, Ordering::SeqCst);
+        self.track_has_played.store(false, Ordering::SeqCst);
+        self.seek_offset_bits.store(0.0f64.to_bits(), Ordering::SeqCst);
+        if let Ok(mut dur) = self.current_duration.lock() {
+            *dur = 0.0;
+        }
+        if let Ok(mut url) = self.current_url.lock() {
+            *url = None;
+        }
+        if let Ok(mut err) = self.current_error.lock() {
+            *err = None;
+        }
+        if let Ok(mut cb) = self.cached_bytes.lock() {
+            *cb = None;
+        }
+        if let Ok(mut prog) = self.active_progressive.lock() {
+            *prog = None;
+        }
+        if let Ok(player_guard) = self.player.lock() {
+            if let Some(player) = player_guard.as_ref() {
+                player.clear();
+                player.pause();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_ended_for_test(&self) {
+        self.has_ended.store(true, Ordering::SeqCst);
     }
 
     pub fn toggle(&self) -> Result<bool, String> {

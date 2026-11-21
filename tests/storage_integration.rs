@@ -1,7 +1,7 @@
 use app_lib::storage::{
     clear_cache, get_audio_cache_dir, get_cache_dir, get_cache_stats, get_cached_audio_path,
     get_cached_lyrics, get_storage_path, save_cached_audio, save_cached_lyrics, AppStateSnapshot,
-    RepeatMode, TrackSortMode,
+    RepeatMode, TrackRecord, TrackSortMode,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -263,4 +263,234 @@ fn test_cache_stats_and_clear() {
     let (bytes_after, count_after) = get_cache_stats();
     assert_eq!(bytes_after, 0);
     assert_eq!(count_after, 0);
+}
+
+#[test]
+fn test_legacy_null_fields_and_per_element_resilience_roundtrip() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let guard = TempDataDirGuard::new("null_fields");
+
+    let playlists_str = json!([
+        {
+            "id": "pl_1",
+            "name": "Keep Me",
+            "description": null,
+            "cover": null,
+            "sort_mode": null,
+            "tracks": [
+                {
+                    "id": "1",
+                    "title": "Valid",
+                    "artist": "A",
+                    "album": null,
+                    "duration": 120.0,
+                    "thumbnail": null,
+                    "cover": null,
+                    "path": null,
+                    "url": "C:\\Music\\Valid.mp3",
+                    "platform": "local",
+                    "addedAt": null
+                }
+            ]
+        },
+        {
+            "id": "pl_2",
+            "name": "With Null",
+            "tracks": [
+                {
+                    "id": "2",
+                    "title": null,
+                    "artist": null,
+                    "album": null,
+                    "duration": null,
+                    "platform": "ytmusic"
+                },
+                "unparseable_track_entry",
+                null
+            ]
+        },
+        {
+            "id": "pl_null_tracks",
+            "name": "Null Tracks",
+            "tracks": null
+        },
+        "corrupt_playlist_entry",
+        12345
+    ])
+    .to_string();
+
+    let favorites_str = json!([
+        {
+            "id": "fav_1",
+            "title": "Fav",
+            "artist": null,
+            "album": null,
+            "duration": null,
+            "platform": "ytmusic"
+        },
+        null,
+        "bad_fav"
+    ])
+    .to_string();
+
+    let saved_albums_str = json!([
+        {
+            "id": "alb_1",
+            "title": "Album One",
+            "artist": null,
+            "cover": null,
+            "year": 2024,
+            "trackCount": null
+        },
+        "bad_album"
+    ])
+    .to_string();
+
+    let renames_str = json!({
+        "ytmusic:fav_1": {"title": "Renamed", "artist": null, "updatedAt": null},
+        "bad_entry": "not_an_object"
+    })
+    .to_string();
+
+    let trims_str = json!({
+        "ytmusic:fav_1": {"start": null, "end": 45.0, "updatedAt": null},
+        "bad_trim": 42
+    })
+    .to_string();
+
+    let art_str = json!({
+        "ytmusic:fav_1": {"cover": null, "banner": "https://example.com/b.jpg"},
+        "bad_art": []
+    })
+    .to_string();
+
+    let storage_obj = json!({
+        "devsize_playlists": playlists_str,
+        "devsize_favorites": favorites_str,
+        "riff_saved_albums": saved_albums_str,
+        "riff_track_renames": renames_str,
+        "riff_track_trims": trims_str,
+        "riff_track_art": art_str
+    });
+
+    fs::write(
+        guard.dir.join("storage.json"),
+        serde_json::to_string_pretty(&storage_obj).unwrap(),
+    )
+    .unwrap();
+
+    let mut snap = AppStateSnapshot::load();
+    assert_eq!(snap.playlists.len(), 3);
+    assert_eq!(snap.playlists[0].name, "Keep Me");
+    assert_eq!(snap.playlists[0].tracks.len(), 1);
+    assert_eq!(snap.playlists[1].name, "With Null");
+    assert_eq!(snap.playlists[1].tracks.len(), 1);
+    assert_eq!(snap.playlists[1].tracks[0].duration, 0.0);
+    assert_eq!(snap.playlists[2].tracks.len(), 0);
+
+    assert_eq!(snap.favorites.len(), 1);
+    assert_eq!(snap.favorites[0].title, "Fav");
+    assert_eq!(snap.saved_albums.len(), 1);
+    assert_eq!(snap.saved_albums[0].year.as_deref(), Some("2024"));
+    assert_eq!(snap.track_renames.len(), 1);
+    assert_eq!(snap.track_trims["ytmusic:fav_1"].end, 45.0);
+    assert_eq!(
+        snap.track_art["ytmusic:fav_1"].banner.as_deref(),
+        Some("https://example.com/b.jpg")
+    );
+
+    snap.save();
+    let reloaded = AppStateSnapshot::load();
+    assert_eq!(reloaded.playlists.len(), 3);
+    assert_eq!(reloaded.playlists[1].tracks.len(), 1);
+    assert_eq!(reloaded.favorites.len(), 1);
+    assert_eq!(reloaded.saved_albums.len(), 1);
+}
+
+#[test]
+fn test_local_tracks_nonempty_precedence_and_removed_matching() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = TempDataDirGuard::new("local_precedence");
+
+    let mut raw: HashMap<String, serde_json::Value> = HashMap::new();
+    raw.insert("devsize_local_tracks".into(), json!("[]"));
+    raw.insert(
+        "riff_local_tracks".into(),
+        json!([
+            {"id": "loc1", "title": "Keep", "path": "C:\\Music\\Keep.mp3", "platform": "local"},
+            {"id": "loc_fp", "title": "Removed By FilePath", "filePath": "C:\\Music\\GoneFP.mp3", "platform": "local"},
+            {"id": "loc_id_removed", "title": "Removed By Id", "path": "C:\\Music\\GoneId.mp3", "platform": "local"}
+        ])
+        .to_string()
+        .into(),
+    );
+    raw.insert(
+        "riff_removed_local_paths".into(),
+        json!(["C:\\Music\\GoneFP.mp3", "loc_id_removed"])
+            .to_string()
+            .into(),
+    );
+
+    let snap = AppStateSnapshot::from_storage_map(raw);
+    assert_eq!(snap.local_tracks.len(), 1);
+    assert_eq!(snap.local_tracks[0].id, "loc1");
+
+    // Empty riff_local_tracks should fall back to populated devsize_local_tracks
+    let mut fallback_raw: HashMap<String, serde_json::Value> = HashMap::new();
+    fallback_raw.insert("riff_local_tracks".into(), json!("[]"));
+    fallback_raw.insert(
+        "devsize_local_tracks".into(),
+        json!([{"id": "loc2", "title": "Fallback", "path": "C:\\Music\\F.mp3", "platform": "local"}])
+            .to_string()
+            .into(),
+    );
+    let snap2 = AppStateSnapshot::from_storage_map(fallback_raw);
+    assert_eq!(snap2.local_tracks.len(), 1);
+    assert_eq!(snap2.local_tracks[0].id, "loc2");
+}
+
+#[test]
+fn test_track_record_matches_respects_differing_platforms() {
+    let yt = TrackRecord {
+        id: "shared_123".to_string(),
+        platform: "ytmusic".to_string(),
+        title: "Song A".to_string(),
+        ..Default::default()
+    };
+    let sc = TrackRecord {
+        id: "shared_123".to_string(),
+        platform: "soundcloud".to_string(),
+        title: "Song B".to_string(),
+        ..Default::default()
+    };
+    let no_plat = TrackRecord {
+        id: "shared_123".to_string(),
+        platform: String::new(),
+        ..Default::default()
+    };
+    let yt_upper = TrackRecord {
+        id: "shared_123".to_string(),
+        platform: "YTMusic".to_string(),
+        ..Default::default()
+    };
+
+    assert!(!yt.matches(&sc));
+    assert!(yt.matches(&no_plat));
+    assert!(yt.matches(&yt_upper));
+}
+
+#[test]
+fn test_repeat_mode_fallback_on_unrecognized_primary_key() {
+    let mut raw: HashMap<String, serde_json::Value> = HashMap::new();
+    raw.insert("raser_repeat_mode".into(), json!("bogus_value"));
+    raw.insert("riff_repeat".into(), json!("1"));
+
+    let snap = AppStateSnapshot::from_storage_map(raw);
+    assert_eq!(snap.settings.repeat_mode, RepeatMode::One);
+
+    let mut raw2: HashMap<String, serde_json::Value> = HashMap::new();
+    raw2.insert("raser_repeat_mode".into(), json!("invalid"));
+    raw2.insert("riff_repeat_mode".into(), json!("all"));
+    let snap2 = AppStateSnapshot::from_storage_map(raw2);
+    assert_eq!(snap2.settings.repeat_mode, RepeatMode::All);
 }

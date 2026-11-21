@@ -39,9 +39,9 @@ pub fn read_storage_raw() -> String {
     let path = get_storage_path();
     if path.exists() {
         if let Ok(content) = fs::read_to_string(&path) {
-            let trimmed = content.trim();
+            let trimmed = content.trim_start_matches('\u{feff}').trim();
             if !trimmed.is_empty() && (trimmed.starts_with('{') || trimmed.starts_with('[')) {
-                return content;
+                return trimmed.to_string();
             }
         }
     }
@@ -169,22 +169,109 @@ pub fn clear_cache() {
 
 // --- Typed Domain Structs & v1.2.6 Polymorphic JSON Adapters ---
 
+fn deserialize_lossy_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Value>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(Value::String(s)) => s,
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    })
+}
+
+fn deserialize_null_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Value>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
+fn deserialize_lossy_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Value>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite()).unwrap_or(0.0),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
+
+fn deserialize_null_opt_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Value>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(Value::Number(n)) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f.round() as u64)
+        }),
+        Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
+fn deserialize_resilient_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let opt = Option::<Value>::deserialize(deserializer)?;
+    let Some(Value::Array(arr)) = opt else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if let Ok(parsed) = serde_json::from_value::<T>(item) {
+            out.push(parsed);
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct TrackRecord {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub id: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub title: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub artist: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub album: String,
+    #[serde(deserialize_with = "deserialize_lossy_f64")]
     pub duration: f64,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub thumbnail: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub cover: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub path: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub url: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub platform: String,
-    #[serde(rename = "addedAt", default)]
+    #[serde(rename = "addedAt", default, deserialize_with = "deserialize_null_opt_u64")]
     pub added_at: Option<u64>,
-    #[serde(rename = "playedAt", default)]
+    #[serde(rename = "playedAt", default, deserialize_with = "deserialize_null_opt_u64")]
     pub played_at: Option<u64>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -217,7 +304,12 @@ impl TrackRecord {
 
     pub fn matches(&self, other: &TrackRecord) -> bool {
         if !self.id.is_empty() && !other.id.is_empty() && self.id == other.id {
-            return true;
+            let p1 = self.platform.trim();
+            let p2 = other.platform.trim();
+            if p1.is_empty() || p2.is_empty() || p1.eq_ignore_ascii_case(p2) {
+                return true;
+            }
+            return false;
         }
         if !self.path.is_empty() && !other.path.is_empty() && self.path == other.path {
             return true;
@@ -228,6 +320,11 @@ impl TrackRecord {
     pub fn playable_source(&self) -> String {
         if !self.path.trim().is_empty() {
             self.path.clone()
+        } else if let Some(fp) = self.extra.get("filePath").and_then(|v| v.as_str()) {
+            if !fp.trim().is_empty() {
+                return fp.to_string();
+            }
+            self.url.clone()
         } else {
             self.url.clone()
         }
@@ -261,11 +358,17 @@ impl From<LocalTrack> for TrackRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct PlaylistRecord {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub id: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub name: String,
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
     pub description: Option<String>,
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
     pub cover: Option<String>,
+    #[serde(deserialize_with = "deserialize_resilient_vec")]
     pub tracks: Vec<TrackRecord>,
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
     pub sort_mode: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -273,19 +376,44 @@ pub struct PlaylistRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
-pub struct TrackRename {
+pub struct SavedAlbumRecord {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub title: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
     pub artist: String,
-    #[serde(rename = "updatedAt", default)]
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
+    pub cover: Option<String>,
+    #[serde(rename = "type", deserialize_with = "deserialize_null_opt_string")]
+    pub album_type: Option<String>,
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
+    pub year: Option<String>,
+    #[serde(rename = "trackCount", deserialize_with = "deserialize_null_opt_u64")]
+    pub track_count: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct TrackRename {
+    #[serde(deserialize_with = "deserialize_lossy_string")]
+    pub title: String,
+    #[serde(deserialize_with = "deserialize_lossy_string")]
+    pub artist: String,
+    #[serde(rename = "updatedAt", default, deserialize_with = "deserialize_null_opt_u64")]
     pub updated_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct TrackTrim {
+    #[serde(deserialize_with = "deserialize_lossy_f64")]
     pub start: f64,
+    #[serde(deserialize_with = "deserialize_lossy_f64")]
     pub end: f64,
-    #[serde(rename = "updatedAt", default)]
+    #[serde(rename = "updatedAt", default, deserialize_with = "deserialize_null_opt_u64")]
     pub updated_at: Option<u64>,
 }
 
@@ -301,7 +429,9 @@ impl TrackTrim {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct TrackArt {
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
     pub cover: Option<String>,
+    #[serde(deserialize_with = "deserialize_null_opt_string")]
     pub banner: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -452,7 +582,7 @@ pub struct AppStateSnapshot {
     pub history: Vec<TrackRecord>,
     pub local_tracks: Vec<TrackRecord>,
     pub removed_local_paths: Vec<String>,
-    pub saved_albums: Vec<Value>,
+    pub saved_albums: Vec<SavedAlbumRecord>,
     pub track_renames: HashMap<String, TrackRename>,
     pub track_trims: HashMap<String, TrackTrim>,
     pub track_art: HashMap<String, TrackArt>,
@@ -460,6 +590,20 @@ pub struct AppStateSnapshot {
     pub last_track: Option<TrackRecord>,
     pub settings: AppSettings,
     pub raw_map: HashMap<String, Value>,
+}
+
+fn decode_raw_json_value(val: &Value) -> Option<Value> {
+    match val {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        }
+        Value::Null => None,
+        other => Some(other.clone()),
+    }
 }
 
 pub fn decode_value<T: DeserializeOwned>(val: &Value) -> Option<T> {
@@ -479,6 +623,34 @@ pub fn decode_value<T: DeserializeOwned>(val: &Value) -> Option<T> {
     }
 }
 
+pub fn decode_resilient_vec<T: DeserializeOwned>(val: &Value) -> Option<Vec<T>> {
+    let raw = decode_raw_json_value(val)?;
+    let Value::Array(arr) = raw else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if let Ok(parsed) = serde_json::from_value::<T>(item) {
+            out.push(parsed);
+        }
+    }
+    Some(out)
+}
+
+pub fn decode_resilient_map<T: DeserializeOwned>(val: &Value) -> Option<HashMap<String, T>> {
+    let raw = decode_raw_json_value(val)?;
+    let Value::Object(obj) = raw else {
+        return None;
+    };
+    let mut out = HashMap::with_capacity(obj.len());
+    for (k, v) in obj {
+        if let Ok(parsed) = serde_json::from_value::<T>(v) {
+            out.insert(k, parsed);
+        }
+    }
+    Some(out)
+}
+
 pub fn decode_json_field<T: DeserializeOwned>(
     map: &HashMap<String, Value>,
     keys: &[&str],
@@ -486,6 +658,34 @@ pub fn decode_json_field<T: DeserializeOwned>(
     for &key in keys {
         if let Some(val) = map.get(key) {
             if let Some(parsed) = decode_value::<T>(val) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+pub fn decode_json_vec_field<T: DeserializeOwned>(
+    map: &HashMap<String, Value>,
+    keys: &[&str],
+) -> Option<Vec<T>> {
+    for &key in keys {
+        if let Some(val) = map.get(key) {
+            if let Some(parsed) = decode_resilient_vec::<T>(val) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+pub fn decode_json_map_field<T: DeserializeOwned>(
+    map: &HashMap<String, Value>,
+    keys: &[&str],
+) -> Option<HashMap<String, T>> {
+    for &key in keys {
+        if let Some(val) = map.get(key) {
+            if let Some(parsed) = decode_resilient_map::<T>(val) {
                 return Some(parsed);
             }
         }
@@ -630,69 +830,85 @@ impl AppStateSnapshot {
     }
 
     pub fn from_storage_map(map: HashMap<String, Value>) -> Self {
-        let playlists = decode_json_field::<Vec<PlaylistRecord>>(&map, &["devsize_playlists"])
+        let playlists = decode_json_vec_field::<PlaylistRecord>(&map, &["devsize_playlists"])
             .unwrap_or_default();
-        let favorites = decode_json_field::<Vec<TrackRecord>>(&map, &["devsize_favorites"])
+        let favorites = decode_json_vec_field::<TrackRecord>(&map, &["devsize_favorites"])
             .unwrap_or_default();
-        let history = decode_json_field::<Vec<TrackRecord>>(&map, &["devsize_history"])
+        let history = decode_json_vec_field::<TrackRecord>(&map, &["devsize_history"])
             .unwrap_or_default();
 
         let removed_local_paths =
-            decode_json_field::<Vec<String>>(&map, &["riff_removed_local_paths"])
+            decode_json_vec_field::<String>(&map, &["riff_removed_local_paths"])
                 .unwrap_or_default();
         let removed_set: HashSet<&str> = removed_local_paths.iter().map(|s| s.as_str()).collect();
 
-        let raw_local = decode_json_field::<Vec<TrackRecord>>(
-            &map,
-            &[
-                "devsize_local_tracks",
-                "riff_local_tracks",
-                "raser_local_tracks",
-                "devsize_local_files",
-                "riff_local_files",
-                "raser_local_files",
-            ],
-        )
-        .unwrap_or_default();
+        // Match ui/app.js:959 — prefer the first non-empty local-track array across keys
+        let mut raw_local = Vec::new();
+        for &key in &[
+            "riff_local_tracks",
+            "raser_local_tracks",
+            "devsize_local_tracks",
+            "riff_local_files",
+            "raser_local_files",
+            "devsize_local_files",
+        ] {
+            if let Some(val) = map.get(key) {
+                if let Some(arr) = decode_resilient_vec::<TrackRecord>(val) {
+                    if !arr.is_empty() {
+                        raw_local = arr;
+                        break;
+                    }
+                }
+            }
+        }
 
         let local_tracks = raw_local
             .into_iter()
             .filter(|t| {
+                let file_path = t
+                    .extra
+                    .get("filePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let p = if !t.path.is_empty() {
                     t.path.as_str()
+                } else if !file_path.is_empty() {
+                    file_path
                 } else {
                     t.url.as_str()
                 };
-                !removed_set.contains(p)
+                let path_removed = !p.is_empty() && removed_set.contains(p);
+                let id_removed = !t.id.is_empty() && removed_set.contains(t.id.as_str());
+                !path_removed && !id_removed
             })
             .collect();
 
-        let saved_albums = decode_json_field::<Vec<Value>>(
+        let saved_albums = decode_json_vec_field::<SavedAlbumRecord>(
             &map,
             &["riff_saved_albums", "raser_saved_albums", "devsize_saved_albums"],
         )
         .unwrap_or_default();
 
-        let track_renames = decode_json_field::<HashMap<String, TrackRename>>(
+        let track_renames = decode_json_map_field::<TrackRename>(
             &map,
             &["riff_track_renames", "raser_track_renames", "devsize_track_renames"],
         )
         .unwrap_or_default();
 
-        let track_trims = decode_json_field::<HashMap<String, TrackTrim>>(
+        let track_trims = decode_json_map_field::<TrackTrim>(
             &map,
             &["riff_track_trims", "raser_track_trims", "devsize_track_trims"],
         )
         .unwrap_or_default();
 
-        let track_art = decode_json_field::<HashMap<String, TrackArt>>(
+        let track_art = decode_json_map_field::<TrackArt>(
             &map,
             &["riff_track_art", "raser_track_art", "devsize_track_art"],
         )
         .unwrap_or_default();
 
         let queue =
-            decode_json_field::<Vec<TrackRecord>>(&map, &["devsize_queue"]).unwrap_or_default();
+            decode_json_vec_field::<TrackRecord>(&map, &["devsize_queue"]).unwrap_or_default();
         let last_track = decode_json_field::<TrackRecord>(&map, &["devsize_last_track"]);
 
         let mut settings = AppSettings::default();
@@ -705,17 +921,17 @@ impl AppStateSnapshot {
         if let Some(sh) = decode_bool_field(&map, &["riff_shuffle", "raser_shuffle"]) {
             settings.shuffle = sh;
         }
-        if let Some(rep) = decode_string_field(
-            &map,
-            &[
-                "raser_repeat_mode",
-                "riff_repeat_mode",
-                "raser_repeat",
-                "riff_repeat",
-            ],
-        ) {
-            if let Some(mode) = RepeatMode::from_legacy_str(&rep) {
-                settings.repeat_mode = mode;
+        for &key in &[
+            "raser_repeat_mode",
+            "riff_repeat_mode",
+            "raser_repeat",
+            "riff_repeat",
+        ] {
+            if let Some(rep) = decode_string_field(&map, &[key]) {
+                if let Some(mode) = RepeatMode::from_legacy_str(&rep) {
+                    settings.repeat_mode = mode;
+                    break;
+                }
             }
         }
         if let Some(spd) = decode_f32_field(&map, &["riff_speed", "raser_speed"]) {
@@ -726,7 +942,7 @@ impl AppStateSnapshot {
             settings.platform = p;
         }
         if let Some(order) =
-            decode_json_field::<Vec<String>>(&map, &["riff_sidebar_order", "raser_sidebar_order"])
+            decode_json_vec_field::<String>(&map, &["riff_sidebar_order", "raser_sidebar_order"])
         {
             settings.sidebar_order = normalize_sidebar_order(order);
         }
@@ -738,7 +954,7 @@ impl AppStateSnapshot {
             settings.playlist_sort = TrackSortMode::from_str_lossy(&s);
         }
         if let Some(pinned) =
-            decode_json_field::<Vec<String>>(&map, &["riff_pinned_tracks", "raser_pinned_tracks"])
+            decode_json_vec_field::<String>(&map, &["riff_pinned_tracks", "raser_pinned_tracks"])
         {
             settings.pinned_tracks = pinned;
         }
@@ -826,7 +1042,17 @@ impl AppStateSnapshot {
 
         let local_val = encode_storage_json_string(&self.local_tracks);
         map.insert("devsize_local_tracks".to_string(), local_val.clone());
-        map.insert("riff_local_tracks".to_string(), local_val);
+        map.insert("riff_local_tracks".to_string(), local_val.clone());
+        if map.contains_key("raser_local_tracks") {
+            map.insert("raser_local_tracks".to_string(), local_val.clone());
+        }
+        if self.local_tracks.is_empty() {
+            for k in ["riff_local_files", "raser_local_files", "devsize_local_files"] {
+                if map.contains_key(k) {
+                    map.insert(k.to_string(), local_val.clone());
+                }
+            }
+        }
 
         map.insert(
             "riff_removed_local_paths".to_string(),

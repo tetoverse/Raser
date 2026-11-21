@@ -386,6 +386,7 @@ pub enum Message {
     NavigateBack,
     SearchQueryChanged(String),
     SearchFocused(bool),
+    FocusSearchBox,
 
     PlayTracks(Vec<TrackRecord>, usize),
     PlayPlaylist(String),
@@ -651,17 +652,16 @@ impl RaserApp {
         self.snapshot.last_track = Some(entry);
     }
 
-    fn start_loading_current(&mut self) -> Task<Message> {
-        let Some(tr) = self.current_track() else {
-            return Task::none();
-        };
+    fn load_track_task(&mut self, tr: &TrackRecord, record_history: bool) -> Task<Message> {
         let url = tr.playable_source();
         if url.trim().is_empty() {
             return Task::none();
         }
-        self.record_history(&tr);
-        self.snapshot.queue = self.queue.clone();
-        self.snapshot.save();
+        if record_history {
+            self.record_history(tr);
+            self.snapshot.queue = self.queue.clone();
+            self.snapshot.save();
+        }
 
         self.load_epoch = self.load_epoch.wrapping_add(1);
         let my_load_epoch = self.load_epoch;
@@ -696,6 +696,13 @@ impl RaserApp {
         )
     }
 
+    fn start_loading_current(&mut self) -> Task<Message> {
+        let Some(tr) = self.current_track() else {
+            return Task::none();
+        };
+        self.load_track_task(&tr, true)
+    }
+
     fn dispatch_seek_task(&self, target_secs: f64, epoch: u64) -> Task<Message> {
         let audio = Arc::clone(&self.audio);
         Task::perform(
@@ -722,12 +729,16 @@ impl RaserApp {
         if self.queue.is_empty() {
             return Task::none();
         }
-        if let Some(next_idx) = self.future_history.pop() {
-            if let Some(cur) = self.queue_index {
-                self.play_history.push(cur);
+        while let Some(next_idx) = self.future_history.pop() {
+            if next_idx < self.queue.len() {
+                if let Some(cur) = self.queue_index {
+                    if cur < self.queue.len() {
+                        self.play_history.push(cur);
+                    }
+                }
+                self.queue_index = Some(next_idx);
+                return self.start_loading_current();
             }
-            self.queue_index = Some(next_idx);
-            return self.start_loading_current();
         }
 
         let cur = self.queue_index.unwrap_or(0);
@@ -771,12 +782,16 @@ impl RaserApp {
             return self.request_seek(0.0);
         }
 
-        if let Some(prev_idx) = self.play_history.pop() {
-            if let Some(cur) = self.queue_index {
-                self.future_history.push(cur);
+        while let Some(prev_idx) = self.play_history.pop() {
+            if prev_idx < self.queue.len() {
+                if let Some(cur) = self.queue_index {
+                    if cur < self.queue.len() {
+                        self.future_history.push(cur);
+                    }
+                }
+                self.queue_index = Some(prev_idx);
+                return self.start_loading_current();
             }
-            self.queue_index = Some(prev_idx);
-            return self.start_loading_current();
         }
 
         let cur = self.queue_index.unwrap_or(0);
@@ -792,12 +807,21 @@ impl RaserApp {
         self.start_loading_current()
     }
 
-    fn switch_view(&mut self, next: ActiveView) {
+    fn unfocus_search(&mut self) -> Task<Message> {
+        if self.search_focused {
+            self.search_focused = false;
+            operation::focus(iced::widget::Id::new("raser-unfocus-sentinel"))
+        } else {
+            Task::none()
+        }
+    }
+
+    fn switch_view(&mut self, next: ActiveView) -> Task<Message> {
         if self.active_view != next {
             self.previous_view = Some(self.active_view.clone());
             self.active_view = next;
         }
-        self.search_focused = false;
+        self.unfocus_search()
     }
 
     fn navigate_back(&mut self) {
@@ -836,8 +860,7 @@ impl RaserApp {
                     self.modal = None;
                     Task::none()
                 } else if self.search_focused {
-                    self.search_focused = false;
-                    Task::none()
+                    self.unfocus_search()
                 } else if matches!(self.active_view, ActiveView::PlaylistDetail(_)) {
                     self.navigate_back();
                     Task::none()
@@ -929,10 +952,7 @@ impl RaserApp {
                 }
                 Task::none()
             }
-            Message::SwitchView(v) => {
-                self.switch_view(v);
-                Task::none()
-            }
+            Message::SwitchView(v) => self.switch_view(v),
             Message::NavigateBack => {
                 self.navigate_back();
                 Task::none()
@@ -946,16 +966,20 @@ impl RaserApp {
                 self.search_focused = f;
                 Task::none()
             }
+            Message::FocusSearchBox => {
+                self.search_focused = true;
+                operation::focus(views::search_input_id())
+            }
             Message::PlayTracks(tracks, idx) => {
                 if tracks.is_empty() {
                     return Task::none();
                 }
-                self.search_focused = false;
+                let unfocus = self.unfocus_search();
                 self.queue = tracks;
                 self.queue_index = Some(idx.min(self.queue.len() - 1));
                 self.play_history.clear();
                 self.future_history.clear();
-                self.start_loading_current()
+                Task::batch([unfocus, self.start_loading_current()])
             }
             Message::PlayPlaylist(pid) => {
                 if let Some(pl) = self.snapshot.playlists.iter().find(|p| p.id == pid) {
@@ -1133,30 +1157,8 @@ impl RaserApp {
                 // Auto-advance on track end rising edge
                 if st.ended && !prev_ended {
                     if self.snapshot.settings.repeat_mode == RepeatMode::One {
-                        let start = self
-                            .current_track()
-                            .and_then(|tr| {
-                                self.snapshot
-                                    .track_trims
-                                    .get(&tr.canonical_id())
-                                    .filter(|tm| tm.is_active())
-                                    .map(|tm| tm.start)
-                            })
-                            .unwrap_or(0.0);
-                        let url_opt = self.current_track().map(|tr| tr.playable_source());
-                        if let Some(url) = url_opt {
-                            let audio = Arc::clone(&self.audio);
-                            let my_load_epoch = self.load_epoch;
-                            let tid = self.current_track().map(|t| t.id);
-                            let dur = self.current_track().map(|t| t.duration).filter(|d| *d > 0.0);
-                            return Task::perform(
-                                async move {
-                                    audio
-                                        .load_audio_async(url, Some(start), dur, true, tid)
-                                        .await
-                                },
-                                move |res| Message::AudioLoadFinished(my_load_epoch, res),
-                            );
+                        if let Some(tr) = self.current_track() {
+                            return self.load_track_task(&tr, false);
                         }
                     } else if self.snapshot.settings.advanced.autoplay
                         || self.snapshot.settings.repeat_mode == RepeatMode::All
@@ -1240,14 +1242,17 @@ impl RaserApp {
             }
             Message::TogglePinTrack(tr) => {
                 let cid = tr.canonical_id();
-                if let Some(pos) = self
+                let was_pinned = self
                     .snapshot
                     .settings
                     .pinned_tracks
                     .iter()
-                    .position(|p| p == &cid)
-                {
-                    self.snapshot.settings.pinned_tracks.remove(pos);
+                    .any(|p| p == &cid || (!tr.id.is_empty() && p == &tr.id));
+                if was_pinned {
+                    self.snapshot
+                        .settings
+                        .pinned_tracks
+                        .retain(|p| p != &cid && (tr.id.is_empty() || p != &tr.id));
                 } else {
                     self.snapshot.settings.pinned_tracks.push(cid);
                 }
@@ -1282,22 +1287,71 @@ impl RaserApp {
             Message::ClearQueue => {
                 self.queue.clear();
                 self.queue_index = None;
+                self.play_history.clear();
+                self.future_history.clear();
+                self.load_epoch = self.load_epoch.wrapping_add(1);
+                self.seek_coordinator = SeekCoordinator::default();
+                self.last_ended_reported = false;
+                self.audio.stop();
+                self.audio_state = self.audio.get_state();
                 self.snapshot.queue.clear();
                 self.snapshot.save();
                 Task::none()
             }
             Message::RemoveFromQueue(idx) => {
                 if idx < self.queue.len() {
+                    let removed_active = self.queue_index == Some(idx);
+                    let was_playing = self.audio_state.playing || self.audio_state.loading;
                     self.queue.remove(idx);
+
+                    let remap = |stack: &mut Vec<usize>| {
+                        stack.retain_mut(|i| {
+                            if *i == idx {
+                                false
+                            } else {
+                                if *i > idx {
+                                    *i -= 1;
+                                }
+                                true
+                            }
+                        });
+                    };
+                    remap(&mut self.play_history);
+                    remap(&mut self.future_history);
+
+                    if self.queue.is_empty() {
+                        self.queue_index = None;
+                        self.play_history.clear();
+                        self.future_history.clear();
+                        self.load_epoch = self.load_epoch.wrapping_add(1);
+                        self.seek_coordinator = SeekCoordinator::default();
+                        self.last_ended_reported = false;
+                        self.audio.stop();
+                        self.audio_state = self.audio.get_state();
+                        self.snapshot.queue.clear();
+                        self.snapshot.save();
+                        return Task::none();
+                    }
+
                     if let Some(cur) = self.queue_index {
-                        if self.queue.is_empty() {
-                            self.queue_index = None;
-                        } else if idx < cur {
+                        if idx < cur {
                             self.queue_index = Some(cur - 1);
-                        } else if idx == cur {
+                        } else if removed_active {
                             self.queue_index = Some(cur.min(self.queue.len() - 1));
+                            self.load_epoch = self.load_epoch.wrapping_add(1);
+                            self.seek_coordinator = SeekCoordinator::default();
+                            self.last_ended_reported = false;
+                            self.audio.stop();
+                            self.audio_state = self.audio.get_state();
+                            self.snapshot.queue = self.queue.clone();
+                            self.snapshot.save();
+                            if was_playing {
+                                return self.start_loading_current();
+                            }
+                            return Task::none();
                         }
                     }
+
                     self.snapshot.queue = self.queue.clone();
                     self.snapshot.save();
                 }
@@ -1317,7 +1371,7 @@ impl RaserApp {
                     name: String::new(),
                     description: String::new(),
                 });
-                Task::none()
+                self.unfocus_search()
             }
             Message::OpenRenamePlaylistModal(pid) => {
                 if let Some(pl) = self.snapshot.playlists.iter().find(|p| p.id == pid) {
@@ -1327,7 +1381,7 @@ impl RaserApp {
                         description: pl.description.clone().unwrap_or_default(),
                     });
                 }
-                Task::none()
+                self.unfocus_search()
             }
             Message::DeletePlaylist(pid) => {
                 self.snapshot.playlists.retain(|p| p.id != pid);
@@ -1345,7 +1399,7 @@ impl RaserApp {
                     title,
                     artist,
                 });
-                Task::none()
+                self.unfocus_search()
             }
             Message::OpenTrimTrackModal(tr) => {
                 let cid = tr.canonical_id();
@@ -1367,11 +1421,11 @@ impl RaserApp {
                     start_input: s,
                     end_input: e,
                 });
-                Task::none()
+                self.unfocus_search()
             }
             Message::OpenAddToPlaylistModal(tr) => {
                 self.modal = Some(ModalState::AddToPlaylist { track: tr });
-                Task::none()
+                self.unfocus_search()
             }
             Message::CloseModal => {
                 self.modal = None;
@@ -1417,7 +1471,7 @@ impl RaserApp {
                             extra: HashMap::new(),
                         });
                         self.snapshot.save();
-                        self.switch_view(ActiveView::PlaylistDetail(id));
+                        return self.switch_view(ActiveView::PlaylistDetail(id));
                     }
                 }
                 Task::none()
@@ -1497,22 +1551,32 @@ impl RaserApp {
                     end_input,
                 }) = self.modal.take()
                 {
-                    let start = start_input.trim().parse::<f64>().unwrap_or(0.0).max(0.0);
-                    let end = end_input.trim().parse::<f64>().unwrap_or(0.0).max(0.0);
-                    let cid = track.canonical_id();
-                    if end > start + 1.5 {
-                        self.snapshot.track_trims.insert(
-                            cid,
-                            TrackTrim {
-                                start,
-                                end,
-                                updated_at: Some(now_millis()),
-                            },
-                        );
-                    } else {
-                        self.snapshot.track_trims.remove(&cid);
+                    let parsed_start = start_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite());
+                    let parsed_end = end_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite());
+                    if let (Some(s), Some(e)) = (parsed_start, parsed_end) {
+                        let start = s.max(0.0);
+                        let end = e.max(0.0);
+                        let trim = TrackTrim {
+                            start,
+                            end,
+                            updated_at: Some(now_millis()),
+                        };
+                        let cid = track.canonical_id();
+                        if trim.is_active() {
+                            self.snapshot.track_trims.insert(cid, trim);
+                        } else {
+                            self.snapshot.track_trims.remove(&cid);
+                        }
+                        self.snapshot.save();
                     }
-                    self.snapshot.save();
                 }
                 Task::none()
             }
@@ -1636,6 +1700,8 @@ impl RaserApp {
                         resolve_shortcut(&key, modifiers, input_focused, modal_open)
                     {
                         self.execute_shortcut(action)
+                    } else if !modal_open && matches!(key, Key::Named(Named::Tab)) {
+                        operation::is_focused(views::search_input_id()).map(Message::SearchFocused)
                     } else {
                         Task::none()
                     }
@@ -1644,7 +1710,11 @@ impl RaserApp {
                     if btn == mouse::Button::Back || btn == mouse::Button::Other(3) {
                         self.navigate_back();
                     }
-                    Task::none()
+                    if self.modal.is_none() {
+                        operation::is_focused(views::search_input_id()).map(Message::SearchFocused)
+                    } else {
+                        Task::none()
+                    }
                 }
                 _ => Task::none(),
             },
@@ -1853,5 +1923,213 @@ mod tests {
 
         let opts4 = parse_cli_args(["raser", "--help"]);
         assert!(opts4.show_help);
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct AppTestDirGuard {
+        dir: std::path::PathBuf,
+        prev: Option<String>,
+    }
+
+    impl AppTestDirGuard {
+        fn new(prefix: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("raser_app_test_{}_{}", prefix, nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev = std::env::var("RASER_DATA_DIR").ok();
+            unsafe {
+                std::env::set_var("RASER_DATA_DIR", &dir);
+            }
+            Self { dir, prev }
+        }
+    }
+
+    impl Drop for AppTestDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("RASER_DATA_DIR", v),
+                    None => std::env::remove_var("RASER_DATA_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn make_playable_track(id: &str, title: &str) -> TrackRecord {
+        TrackRecord {
+            id: id.to_string(),
+            title: title.to_string(),
+            artist: "Artist".to_string(),
+            platform: "local".to_string(),
+            url: format!("C:\\Music\\{}.mp3", id),
+            path: format!("C:\\Music\\{}.mp3", id),
+            duration: 180.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_queue_history_remap_active_removal_and_clear() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("queue_history");
+        let (mut app, _) = RaserApp::boot(None);
+
+        let t1 = make_playable_track("t1", "One");
+        let t2 = make_playable_track("t2", "Two");
+        let t3 = make_playable_track("t3", "Three");
+
+        let _ = app.update(Message::PlayTracks(vec![t1.clone(), t2.clone(), t3.clone()], 2));
+        let _ = app.update(Message::JumpToQueueIndex(0));
+        let _ = app.update(Message::JumpToQueueIndex(1));
+        assert_eq!(app.play_history, vec![2, 0]);
+        assert_eq!(app.queue_index, Some(1));
+
+        // Remove index 2 (which is in play_history); play_history must prune 2 -> [0]
+        let _ = app.update(Message::RemoveFromQueue(2));
+        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.play_history, vec![0]);
+
+        let _ = app.update(Message::PrevTrack);
+        assert_eq!(app.queue_index, Some(0));
+        assert!(app.current_track().is_some());
+
+        let _ = app.update(Message::PrevTrack);
+        assert!(app.queue_index.map(|i| i < app.queue.len()).unwrap_or(false));
+        assert!(app.current_track().is_some());
+
+        // Removing active track resets/syncs audio state rather than leaving stale playing flag
+        app.audio_state.playing = true;
+        app.audio_state.duration = 999.0;
+        let _ = app.update(Message::RemoveFromQueue(0));
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue_index, Some(0));
+        assert!(!app.audio_state.playing);
+        assert_eq!(app.audio_state.duration, 0.0);
+
+        // ClearQueue must clear queue, queue_index, play_history, future_history, and audio state
+        app.play_history.push(0);
+        app.future_history.push(0);
+        let _ = app.update(Message::ClearQueue);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue_index, None);
+        assert!(app.play_history.is_empty());
+        assert!(app.future_history.is_empty());
+        assert!(!app.audio_state.playing);
+    }
+
+    #[test]
+    fn test_submit_save_trim_rejects_non_finite() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("trim_nonfinite");
+        let (mut app, _) = RaserApp::boot(None);
+        let tr = make_playable_track("trim_1", "TrimSong");
+        let cid = tr.canonical_id();
+
+        for bad in ["inf", "-inf", "NaN", "not_a_number"] {
+            let _ = app.update(Message::OpenTrimTrackModal(tr.clone()));
+            let _ = app.update(Message::ModalTrimStartChanged("0.0".to_string()));
+            let _ = app.update(Message::ModalTrimEndChanged(bad.to_string()));
+            let _ = app.update(Message::SubmitSaveTrim);
+            assert!(
+                !app.snapshot.track_trims.contains_key(&cid),
+                "non-finite/invalid trim '{}' must not be saved",
+                bad
+            );
+        }
+
+        // Valid finite trim saves cleanly
+        let _ = app.update(Message::OpenTrimTrackModal(tr.clone()));
+        let _ = app.update(Message::ModalTrimStartChanged("5.0".to_string()));
+        let _ = app.update(Message::ModalTrimEndChanged("25.0".to_string()));
+        let _ = app.update(Message::SubmitSaveTrim);
+        let saved = app.snapshot.track_trims.get(&cid).expect("valid trim saved");
+        assert!(saved.is_active());
+        assert_eq!(saved.start, 5.0);
+        assert_eq!(saved.end, 25.0);
+
+        // Non-finite input must not overwrite an existing valid trim either
+        let _ = app.update(Message::OpenTrimTrackModal(tr.clone()));
+        let _ = app.update(Message::ModalTrimStartChanged("NaN".to_string()));
+        let _ = app.update(Message::ModalTrimEndChanged("inf".to_string()));
+        let _ = app.update(Message::SubmitSaveTrim);
+        assert_eq!(app.snapshot.track_trims.get(&cid).unwrap().end, 25.0);
+    }
+
+    #[test]
+    fn test_repeat_one_auto_restart_bumps_load_epoch_and_seek_coordinator() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("repeat_one_epoch");
+        let (mut app, _) = RaserApp::boot(None);
+        let tr = make_playable_track("rep1", "LoopSong");
+
+        let _ = app.update(Message::PlayTracks(vec![tr], 0));
+        app.snapshot.settings.repeat_mode = RepeatMode::One;
+        app.seek_coordinator.finish_load(0.0);
+        app.last_ended_reported = false;
+        let epoch_before = app.load_epoch;
+        let seek_epoch_before = app.seek_coordinator.seek_epoch;
+
+        app.audio.force_ended_for_test();
+        let _ = app.update(Message::Tick);
+
+        assert_eq!(app.load_epoch, epoch_before.wrapping_add(1));
+        assert!(app.seek_coordinator.is_loading);
+        assert_eq!(app.seek_coordinator.seek_epoch, seek_epoch_before.wrapping_add(1));
+        assert!(!app.last_ended_reported);
+    }
+
+    #[test]
+    fn test_toggle_pin_track_unpins_legacy_bare_id() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("legacy_pin");
+        let (mut app, _) = RaserApp::boot(None);
+        let tr = make_playable_track("bare_99", "PinnedLegacy");
+
+        app.snapshot.settings.pinned_tracks = vec!["bare_99".to_string()];
+        assert!(app.is_pinned(&tr));
+
+        // Unpinning a legacy bare ID must remove it rather than pushing canonical_id
+        let _ = app.update(Message::TogglePinTrack(tr.clone()));
+        assert!(!app.is_pinned(&tr));
+        assert!(app.snapshot.settings.pinned_tracks.is_empty());
+
+        // Pinning again uses canonical_id and unpins cleanly
+        let _ = app.update(Message::TogglePinTrack(tr.clone()));
+        assert!(app.is_pinned(&tr));
+        let _ = app.update(Message::TogglePinTrack(tr.clone()));
+        assert!(!app.is_pinned(&tr));
+    }
+
+    #[test]
+    fn test_escape_and_view_switch_clear_search_focused() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("search_focus");
+        let (mut app, _) = RaserApp::boot(None);
+
+        let _ = app.update(Message::FocusSearchBox);
+        assert!(app.search_focused);
+
+        let _ = app.update(Message::SystemEvent(Event::Keyboard(
+            keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Escape),
+                modified_key: Key::Named(Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+        )));
+        assert!(!app.search_focused);
+
+        let _ = app.update(Message::FocusSearchBox);
+        assert!(app.search_focused);
+        let _ = app.update(Message::SwitchView(ActiveView::Favorites));
+        assert!(!app.search_focused);
     }
 }

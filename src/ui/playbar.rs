@@ -31,10 +31,14 @@ pub struct ScrubberProgram {
 }
 
 impl ScrubberProgram {
-    fn ratio_at(&self, bounds: Rectangle, pos: Point) -> f32 {
+    fn ratio_at_local(&self, bounds: Rectangle, local_x: f32) -> f32 {
         let pad = 8.0;
         let usable = (bounds.width - pad * 2.0).max(1.0);
-        ((pos.x - bounds.x - pad) / usable).clamp(0.0, 1.0)
+        ((local_x - pad) / usable).clamp(0.0, 1.0)
+    }
+
+    fn ratio_at(&self, bounds: Rectangle, pos: Point) -> f32 {
+        self.ratio_at_local(bounds, pos.x - bounds.x)
     }
 }
 
@@ -60,7 +64,7 @@ impl canvas::Program<Message> for ScrubberProgram {
                     if let Some(pos) = cursor.position_in(bounds) {
                         state.hovered = true;
                         state.hover_x = pos.x;
-                        let ratio = (pos.x / bounds.width.max(1.0)).clamp(0.0, 1.0);
+                        let ratio = self.ratio_at_local(bounds, pos.x);
                         let target = ratio as f64 * self.duration;
                         if state.dragging {
                             return Some(canvas::Action::publish(Message::ScrubberDrag(target)).and_capture());
@@ -84,7 +88,7 @@ impl canvas::Program<Message> for ScrubberProgram {
                         state.dragging = true;
                         state.hovered = true;
                         state.hover_x = pos.x;
-                        let ratio = (pos.x / bounds.width.max(1.0)).clamp(0.0, 1.0);
+                        let ratio = self.ratio_at_local(bounds, pos.x);
                         let target = ratio as f64 * self.duration;
                         return Some(canvas::Action::publish(Message::ScrubberDrag(target)).and_capture());
                     }
@@ -189,12 +193,14 @@ impl canvas::Program<Message> for ScrubberProgram {
 
         // Hover timestamp pill tooltip
         if (state.hovered || state.dragging) && self.enabled && self.duration > 0.0 {
-            let hover_ratio = (state.hover_x / bounds.width.max(1.0)).clamp(0.0, 1.0);
+            let hover_ratio = self.ratio_at_local(bounds, state.hover_x);
             let hover_secs = hover_ratio as f64 * self.duration;
             let label = format_mm_ss(hover_secs);
             let pill_w = 44.0;
             let pill_h = 18.0;
-            let pill_x = (state.hover_x - pill_w / 2.0).clamp(0.0, (bounds.width - pill_w).max(0.0));
+            let thumb_center_x = pad + track_w * hover_ratio;
+            let pill_x =
+                (thumb_center_x - pill_w / 2.0).clamp(0.0, (bounds.width - pill_w).max(0.0));
             let pill_y = 0.0;
             let pill_rect = Path::rounded_rectangle(
                 Point::new(pill_x, pill_y),
@@ -405,7 +411,7 @@ pub fn view_playbar<'a>(app: &'a RaserApp, p: M3Palette) -> Element<'a, Message>
             .align_y(Alignment::Center),
     )
     .width(Length::Fixed(play_btn_w))
-    .height(Length::Fixed(46.0))
+    .height(Length::Fixed(48.0))
     .padding(0)
     .style(move |_, status| {
         let mut s = pill_primary_btn(p, status);

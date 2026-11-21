@@ -75,6 +75,40 @@ fn test_normalize_audio_url_legacy_and_local() {
         raw_pct,
         AudioSourceKind::LocalPath(PathBuf::from(r"C:\Music\100% Pure.mp3"))
     );
+
+    // Non-existent raw local path with %20 MUST stay literal (never url-decoded)
+    let raw_50cent = normalize_audio_url(r"C:\Music\50%20Cent - In Da Club.mp3");
+    assert_eq!(
+        raw_50cent,
+        AudioSourceKind::LocalPath(PathBuf::from(r"C:\Music\50%20Cent - In Da Club.mp3"))
+    );
+
+    // Case-insensitive HTTP/HTTPS schemes preserving original suffix casing
+    assert_eq!(
+        normalize_audio_url("HTTPS://Example.COM/Stream?Id=AbC"),
+        AudioSourceKind::RemoteHttp("HTTPS://Example.COM/Stream?Id=AbC".to_string())
+    );
+    assert_eq!(
+        normalize_audio_url("HTTP://Example.COM/Audio"),
+        AudioSourceKind::RemoteHttp("HTTP://Example.COM/Audio".to_string())
+    );
+
+    // Case-insensitive asset.localhost and file:// prefixes preserving suffix casing
+    let upper_asset = normalize_audio_url("HTTP://ASSET.LOCALHOST/C%3A%2FMusic%2F50%20Cent.mp3");
+    match upper_asset {
+        AudioSourceKind::LocalPath(p) => {
+            assert!(p.to_string_lossy().ends_with("50 Cent.mp3"));
+        }
+        other => panic!("expected LocalPath, got {:?}", other),
+    }
+
+    let upper_file = normalize_audio_url("FILE:///C:/Users/Test/My%20Song.wav");
+    match upper_file {
+        AudioSourceKind::LocalPath(p) => {
+            assert!(p.to_string_lossy().ends_with("My Song.wav"));
+        }
+        other => panic!("expected LocalPath, got {:?}", other),
+    }
 }
 
 struct TempFileGuard(PathBuf);
