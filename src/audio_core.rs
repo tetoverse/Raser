@@ -1775,4 +1775,34 @@ mod tests {
         let st = core.get_state();
         assert!(!st.ended, "ended must not trigger while a seek is active");
     }
+
+    #[test]
+    fn test_mark_load_failed_does_not_clobber_superseded_load() {
+        let core = AudioCore::new();
+        core.load_generation.store(2, Ordering::SeqCst);
+        core.is_playing.store(true, Ordering::SeqCst);
+        core.is_loading.store(true, Ordering::SeqCst);
+        *core.current_url.lock().unwrap() = Some("newer_track.wav".to_string());
+        *core.current_error.lock().unwrap() = None;
+
+        // Stale generation 1 failure must NOT clobber newer load generation 2
+        core.mark_load_failed(1, "stale load error");
+        assert!(core.is_playing.load(Ordering::SeqCst));
+        assert!(core.is_loading.load(Ordering::SeqCst));
+        assert_eq!(
+            core.current_url.lock().unwrap().as_deref(),
+            Some("newer_track.wav")
+        );
+        assert!(core.current_error.lock().unwrap().is_none());
+
+        // Matching generation 2 failure resets playing, loading, url, and records error
+        core.mark_load_failed(2, "decoder failed");
+        assert!(!core.is_playing.load(Ordering::SeqCst));
+        assert!(!core.is_loading.load(Ordering::SeqCst));
+        assert!(core.current_url.lock().unwrap().is_none());
+        assert_eq!(
+            core.current_error.lock().unwrap().as_deref(),
+            Some("decoder failed")
+        );
+    }
 }

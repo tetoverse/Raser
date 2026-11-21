@@ -316,3 +316,58 @@ async fn test_audio_core_stop_resets_position_and_ended_after_playback() {
         Err(e) => panic!("Unexpected load_audio_async error: {}", e),
     }
 }
+
+#[tokio::test]
+async fn test_audio_core_failed_load_resets_playing_loading_and_url() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let corrupt_path = std::env::temp_dir().join(format!("raser_corrupt_test_{}.wav", nanos));
+    let _guard = TempFileGuard(corrupt_path.clone());
+    fs::write(&corrupt_path, b"not-a-valid-wav-payload-12345").unwrap();
+
+    let core = Arc::new(AudioCore::new());
+    let corrupt_res = core
+        .load_audio_async(
+            corrupt_path.to_string_lossy().to_string(),
+            None,
+            Some(2.0),
+            true,
+            None,
+        )
+        .await;
+    assert!(
+        corrupt_res.is_err(),
+        "corrupt WAV load_audio_async must fail"
+    );
+
+    let st_corrupt = core.get_state();
+    assert!(!st_corrupt.playing, "failed corrupt load must reset playing=false");
+    assert!(!st_corrupt.loading, "failed corrupt load must reset loading=false");
+    assert!(st_corrupt.url.is_none(), "failed corrupt load must clear url");
+    assert!(st_corrupt.error.is_some(), "failed corrupt load must record error");
+    assert!(!st_corrupt.ended, "failed corrupt load must not report ended");
+
+    let missing_path = std::env::temp_dir().join(format!("raser_missing_test_{}.wav", nanos));
+    let missing_res = core
+        .load_audio_async(
+            missing_path.to_string_lossy().to_string(),
+            None,
+            Some(2.0),
+            true,
+            None,
+        )
+        .await;
+    assert!(
+        missing_res.is_err(),
+        "missing WAV load_audio_async must fail"
+    );
+
+    let st_missing = core.get_state();
+    assert!(!st_missing.playing, "failed missing load must reset playing=false");
+    assert!(!st_missing.loading, "failed missing load must reset loading=false");
+    assert!(st_missing.url.is_none(), "failed missing load must clear url");
+    assert!(st_missing.error.is_some(), "failed missing load must record error");
+    assert!(!st_missing.ended, "failed missing load must not report ended");
+}
