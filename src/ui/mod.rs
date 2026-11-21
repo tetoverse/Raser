@@ -1,3 +1,4 @@
+pub mod karaoke;
 pub mod playbar;
 pub mod sidebar;
 pub mod titlebar;
