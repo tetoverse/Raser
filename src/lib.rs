@@ -3,6 +3,7 @@ pub mod audio_core;
 pub mod discord;
 pub mod i18n;
 pub mod local_files;
+pub mod providers;
 pub mod storage;
 pub mod taskbar;
 pub mod ui;
