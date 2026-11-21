@@ -552,6 +552,10 @@ pub struct AppSettings {
     pub audio_quality: String,
     pub proxy_url: String,
     pub search_history: Vec<String>,
+    pub dynamic_theme: bool,
+    pub discord_rpc: bool,
+    pub discord_artist_in_status: bool,
+    pub minimize_to_tray: bool,
     pub advanced: AdvancedPrefs,
 }
 
@@ -576,6 +580,10 @@ impl Default for AppSettings {
             audio_quality: "high".to_string(),
             proxy_url: String::new(),
             search_history: Vec::new(),
+            dynamic_theme: true,
+            discord_rpc: true,
+            discord_artist_in_status: true,
+            minimize_to_tray: true,
             advanced: AdvancedPrefs::default(),
         }
     }
@@ -992,6 +1000,23 @@ impl AppStateSnapshot {
         ) {
             settings.search_history = sh;
         }
+        if let Some(v) = decode_bool_field(&map, &["riff_dynamic_theme", "raser_dynamic_theme"]) {
+            settings.dynamic_theme = v;
+        }
+        if let Some(v) = decode_bool_field(&map, &["riff_discord_rpc", "raser_discord_rpc"]) {
+            settings.discord_rpc = v;
+        }
+        if let Some(v) = decode_bool_field(
+            &map,
+            &["riff_discord_artist_in_status", "raser_discord_artist_in_status"],
+        ) {
+            settings.discord_artist_in_status = v;
+        }
+        if let Some(v) =
+            decode_bool_field(&map, &["riff_minimize_to_tray", "raser_minimize_to_tray"])
+        {
+            settings.minimize_to_tray = v;
+        }
 
         // Load optional fallback riff_advanced_prefs object first, then override with individual riff_adv_<name> keys
         let mut adv = decode_json_field::<AdvancedPrefs>(
@@ -1180,6 +1205,26 @@ impl AppStateSnapshot {
             Value::String(sh_json.clone()),
         );
         set_mirrored(&mut map, "search_history", sh_json);
+        set_mirrored(
+            &mut map,
+            "dynamic_theme",
+            if self.settings.dynamic_theme { "1" } else { "0" }.to_string(),
+        );
+        set_mirrored(
+            &mut map,
+            "discord_rpc",
+            if self.settings.discord_rpc { "1" } else { "0" }.to_string(),
+        );
+        set_mirrored(
+            &mut map,
+            "discord_artist_in_status",
+            if self.settings.discord_artist_in_status { "1" } else { "0" }.to_string(),
+        );
+        set_mirrored(
+            &mut map,
+            "minimize_to_tray",
+            if self.settings.minimize_to_tray { "1" } else { "0" }.to_string(),
+        );
 
         let set_adv = |m: &mut HashMap<String, Value>, name: &str, v: bool| {
             let s = if v { "true" } else { "false" }.to_string();
