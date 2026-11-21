@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use tauri::Emitter;
 
-const CURRENT_VERSION: &str = "1.1.1";
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION_ENDPOINT: &str = "https://app.raserapp.online/api/desktop-version";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
