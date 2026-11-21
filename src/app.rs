@@ -1,5 +1,7 @@
 use crate::audio_core::{AudioCore, AudioState};
+use crate::discord::{self, DiscordTrackInfo};
 use crate::i18n::{detect_os_lang, Lang};
+use crate::integrations::{hotkeys::HotkeyController, memory, tray::TrayController};
 use crate::local_files;
 use crate::providers::{
     self, AlbumDetail, ArtistDetail, AudioQuality, DiscoverFeed, Platform, ResolvedStream,
@@ -7,6 +9,13 @@ use crate::providers::{
 use crate::storage::{
     self, now_millis, AppStateSnapshot, PlaylistRecord, RepeatMode, TrackRecord, TrackRename,
     TrackSortMode, TrackTrim, DEFAULT_SIDEBAR_ORDER,
+};
+use crate::taskbar::{self, MediaCommand};
+use crate::theme::{
+    analyze_cover_bytes, generate_m3_palette, CoverHueAnalysis, PaletteStyle,
+};
+use crate::ui::visualizer::{
+    self, M3CoverShape, FFT_BINS, HOLD_MS, MORPH_MS,
 };
 use crate::ui::{
     playbar, sidebar, titlebar, views, M3Palette, CORNER_XL, SIDEBAR_CLASSIC_WIDTH,
@@ -25,6 +34,7 @@ use std::time::{Duration, Instant};
 pub enum ActiveView {
     Discover,
     Search,
+    Visualizer,
     Favorites,
     Albums,
     Local,
@@ -39,7 +49,9 @@ pub enum ActiveView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Interface,
+    Themes,
     Playback,
+    Integrations,
     Storage,
     About,
 }
@@ -93,6 +105,7 @@ pub fn parse_view_flag(val: &str) -> Option<ActiveView> {
     match val.trim().to_ascii_lowercase().as_str() {
         "discover" | "home" => Some(ActiveView::Discover),
         "search" => Some(ActiveView::Search),
+        "visualizer" => Some(ActiveView::Visualizer),
         "favorites" | "favs" => Some(ActiveView::Favorites),
         "albums" => Some(ActiveView::Albums),
         "local" => Some(ActiveView::Local),
@@ -300,6 +313,7 @@ pub enum ShortcutAction {
     ToggleFullscreen,
     FocusSearch,
     EscapeUnwind,
+    EmergencyThemeReset,
 }
 
 pub fn resolve_shortcut(
@@ -314,12 +328,18 @@ pub fn resolve_shortcut(
     if let Key::Named(Named::F11) = key {
         return Some(ShortcutAction::ToggleFullscreen);
     }
+    let ctrl = modifiers.control() || modifiers.command();
+    let shift = modifiers.shift();
+    if ctrl && shift {
+        if let Key::Character(c) = key {
+            if c.eq_ignore_ascii_case("r") {
+                return Some(ShortcutAction::EmergencyThemeReset);
+            }
+        }
+    }
     if modal_open {
         return None;
     }
-
-    let ctrl = modifiers.control() || modifiers.command();
-    let shift = modifiers.shift();
 
     if ctrl {
         if let Key::Character(c) = key {
@@ -415,6 +435,16 @@ pub enum Message {
     CheckForUpdates,
     UpdateCheckFinished(Result<UpdateInfo, String>),
     InstallUpdate,
+    WindowHwndReady(isize),
+    CoverFetched(String, Vec<u8>),
+    ToggleDynamicTheme,
+    SetPaletteStyle(PaletteStyle),
+    ResetThemeEmergency,
+    ToggleDiscordRpc,
+    ToggleDiscordArtistInStatus,
+    ToggleMinimizeToTray,
+    ShowFromTray,
+    QuitApp,
 
     PlayTracks(Vec<TrackRecord>, usize),
     PlayPlaylist(String),
@@ -540,6 +570,23 @@ pub struct RaserApp {
     pub update_checking: bool,
     pub update_status: Option<String>,
     pub update_info: Option<UpdateInfo>,
+
+    pub cover_cache: HashMap<String, iced::widget::image::Handle>,
+    pub cover_fetching: std::collections::HashSet<String>,
+    pub cover_analysis: CoverHueAnalysis,
+    pub fft_bins: [f32; FFT_BINS],
+    pub m3_shape_index: usize,
+    pub m3_morph_progress: f32,
+    pub m3_hold_ms: f32,
+
+    pub media_tx: std::sync::mpsc::Sender<MediaCommand>,
+    pub media_rx: std::sync::mpsc::Receiver<MediaCommand>,
+    pub tray_controller: Option<TrayController>,
+    pub hotkey_controller: Option<HotkeyController>,
+    pub window_hidden_to_tray: bool,
+    pub last_trim_at: Instant,
+    pub last_discord_playing: Option<bool>,
+    pub last_discord_cid: Option<String>,
 }
 
 impl RaserApp {
@@ -574,6 +621,7 @@ impl RaserApp {
 
         let search_platform = Platform::from_str_lossy(&snapshot.settings.platform);
         let proxy_input = snapshot.settings.proxy_url.clone();
+        let (media_tx, media_rx) = std::sync::mpsc::channel();
 
         let app = Self {
             audio,
@@ -620,6 +668,21 @@ impl RaserApp {
             update_checking: false,
             update_status: None,
             update_info: None,
+            cover_cache: HashMap::new(),
+            cover_fetching: std::collections::HashSet::new(),
+            cover_analysis: CoverHueAnalysis::default(),
+            fft_bins: [0.0; FFT_BINS],
+            m3_shape_index: 0,
+            m3_morph_progress: 0.0,
+            m3_hold_ms: 0.0,
+            media_tx,
+            media_rx,
+            tray_controller: None,
+            hotkey_controller: None,
+            window_hidden_to_tray: false,
+            last_trim_at: Instant::now(),
+            last_discord_playing: None,
+            last_discord_cid: None,
         };
 
         (app, window::oldest().map(Message::WindowOpened))
@@ -631,7 +694,102 @@ impl RaserApp {
     }
 
     pub fn palette(&self) -> M3Palette {
-        M3Palette::from_mode(&self.snapshot.settings.theme_mode)
+        if self.snapshot.settings.dynamic_theme {
+            let style = PaletteStyle::from_str_lossy(&self.snapshot.settings.palette_style);
+            generate_m3_palette(&self.cover_analysis, style, &self.snapshot.settings.theme_mode)
+        } else {
+            M3Palette::from_mode(&self.snapshot.settings.theme_mode)
+        }
+    }
+
+    pub fn track_cover_url(tr: &TrackRecord) -> Option<String> {
+        let cand = if !tr.thumbnail.trim().is_empty() {
+            tr.thumbnail.trim()
+        } else {
+            tr.cover.trim()
+        };
+        if cand.is_empty() {
+            None
+        } else {
+            Some(cand.to_string())
+        }
+    }
+
+    pub fn current_cover_handle(&self) -> Option<iced::widget::image::Handle> {
+        let tr = self.current_track()?;
+        let url = Self::track_cover_url(&tr)?;
+        self.cover_cache.get(&url).cloned()
+    }
+
+    fn maybe_fetch_cover_task(&mut self, tr: &TrackRecord) -> Task<Message> {
+        let Some(url) = Self::track_cover_url(tr) else {
+            return Task::none();
+        };
+        if self.cover_cache.contains_key(&url) || self.cover_fetching.contains(&url) {
+            return Task::none();
+        }
+        self.cover_fetching.insert(url.clone());
+        let Ok(client) = self.http_client() else {
+            self.cover_fetching.remove(&url);
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    if let Ok(res) = client.get(&url).send().await {
+                        if res.status().is_success() {
+                            if let Ok(bytes) = res.bytes().await {
+                                return (url, bytes.to_vec());
+                            }
+                        }
+                    }
+                } else if let Ok(bytes) = std::fs::read(&url) {
+                    return (url, bytes);
+                }
+                (url, Vec::new())
+            },
+            |(u, b)| Message::CoverFetched(u, b),
+        )
+    }
+
+    fn sync_discord_and_taskbar(&mut self) {
+        let playing = self.audio_state.playing;
+        let is_tr = self.lang == Lang::Tr;
+        taskbar::win::update_playback_state(playing, is_tr);
+
+        let cur = self.current_track();
+        let cur_cid = cur.as_ref().map(|t| t.canonical_id());
+        if self.last_discord_playing == Some(playing) && self.last_discord_cid == cur_cid {
+            return;
+        }
+        self.last_discord_playing = Some(playing);
+        self.last_discord_cid = cur_cid;
+
+        if !self.snapshot.settings.discord_rpc || !playing {
+            discord::clear_presence();
+            return;
+        }
+        if let Some(tr) = cur {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let elapsed = self.audio_state.position.max(0.0) as i64;
+            let dur = self.effective_duration();
+            discord::update_presence(DiscordTrackInfo {
+                title: Some(self.display_title(&tr)),
+                artist: Some(self.display_artist(&tr)),
+                thumbnail: Self::track_cover_url(&tr),
+                start_timestamp: Some(now_secs.saturating_sub(elapsed)),
+                duration: if dur > 0.0 { Some(dur) } else { None },
+                url: if tr.url.starts_with("https://") {
+                    Some(tr.url.clone())
+                } else {
+                    None
+                },
+                artist_in_status: Some(self.snapshot.settings.discord_artist_in_status),
+            });
+        }
     }
 
     pub fn theme(&self) -> Theme {
@@ -839,14 +997,16 @@ impl RaserApp {
         };
 
         let audio = Arc::clone(&self.audio);
-        Task::perform(
+        let load_task = Task::perform(
             async move {
                 audio
                     .load_audio_async(url, start_pos, dur_hint, true, track_id)
                     .await
             },
             move |res| Message::AudioLoadFinished(my_load_epoch, res),
-        )
+        );
+        let cover_task = self.maybe_fetch_cover_task(tr);
+        Task::batch([load_task, cover_task])
     }
 
     fn start_loading_current(&mut self) -> Task<Message> {
@@ -1006,6 +1166,7 @@ impl RaserApp {
             ShortcutAction::ToggleMiniPlayer => self.update(Message::ToggleMiniPlayer),
             ShortcutAction::ToggleFullscreen => self.update(Message::ToggleFullscreen),
             ShortcutAction::FocusSearch => self.update(Message::FocusSearchBox),
+            ShortcutAction::EmergencyThemeReset => self.update(Message::ResetThemeEmergency),
             ShortcutAction::EscapeUnwind => {
                 if self.modal.is_some() {
                     self.modal = None;
@@ -1032,7 +1193,45 @@ impl RaserApp {
             Message::Noop => Task::none(),
             Message::WindowOpened(id) => {
                 self.main_window_id = id;
-                self.update(Message::FetchDiscoverFeed)
+                if self.tray_controller.is_none() {
+                    self.tray_controller = TrayController::try_new(self.lang == Lang::Tr);
+                }
+                if self.hotkey_controller.is_none() {
+                    self.hotkey_controller = HotkeyController::try_new();
+                }
+                let mut tasks = vec![self.update(Message::FetchDiscoverFeed)];
+                if let Some(win_id) = id {
+                    let hwnd_task = window::run(win_id, |w| {
+                        #[cfg(target_os = "windows")]
+                        {
+                            use iced::window::raw_window_handle::RawWindowHandle;
+                            if let Ok(wh) = w.window_handle() {
+                                if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                                    return h.hwnd.get();
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = w;
+                        0isize
+                    })
+                    .map(Message::WindowHwndReady);
+                    tasks.push(hwnd_task);
+                }
+                if let Some(tr) = self.current_track() {
+                    tasks.push(self.maybe_fetch_cover_task(&tr));
+                }
+                Task::batch(tasks)
+            }
+            Message::WindowHwndReady(hwnd) => {
+                if hwnd != 0 {
+                    taskbar::win::setup_taskbar_buttons(
+                        hwnd,
+                        self.lang == Lang::Tr,
+                        self.media_tx.clone(),
+                    );
+                }
+                Task::none()
             }
             Message::DragWindow => {
                 if let Some(id) = self.main_window_id {
@@ -1071,11 +1270,35 @@ impl RaserApp {
             }
             Message::CloseWindow => {
                 self.snapshot.save();
+                if self.snapshot.settings.minimize_to_tray && self.tray_controller.is_some() {
+                    self.window_hidden_to_tray = true;
+                    self.last_trim_at = Instant::now();
+                    memory::trim_working_set();
+                    if let Some(id) = self.main_window_id {
+                        return window::set_mode(id, window::Mode::Hidden);
+                    }
+                }
                 if let Some(id) = self.main_window_id {
                     window::close(id)
                 } else {
                     iced::exit()
                 }
+            }
+            Message::ShowFromTray => {
+                self.window_hidden_to_tray = false;
+                if let Some(id) = self.main_window_id {
+                    Task::batch([
+                        window::set_mode(id, window::Mode::Windowed),
+                        window::gain_focus(id),
+                    ])
+                } else {
+                    Task::none()
+                }
+            }
+            Message::QuitApp => {
+                self.snapshot.save();
+                discord::clear_presence();
+                iced::exit()
             }
             Message::ToggleMiniPlayer => {
                 self.is_mini_player = !self.is_mini_player;
@@ -1398,6 +1621,63 @@ impl RaserApp {
                 }
                 Task::none()
             }
+            Message::CoverFetched(url, bytes) => {
+                self.cover_fetching.remove(&url);
+                if bytes.is_empty() {
+                    return Task::none();
+                }
+                if self.cover_cache.len() >= 64 {
+                    if let Some(old_k) = self.cover_cache.keys().next().cloned() {
+                        self.cover_cache.remove(&old_k);
+                    }
+                }
+                let handle = iced::widget::image::Handle::from_bytes(bytes.clone());
+                self.cover_cache.insert(url.clone(), handle);
+                if let Some(cur) = self.current_track() {
+                    if Self::track_cover_url(&cur).as_deref() == Some(url.as_str()) {
+                        self.cover_analysis = analyze_cover_bytes(&bytes);
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleDynamicTheme => {
+                self.snapshot.settings.dynamic_theme = !self.snapshot.settings.dynamic_theme;
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::SetPaletteStyle(style) => {
+                self.snapshot.settings.palette_style = style.as_str().to_string();
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::ResetThemeEmergency => {
+                self.snapshot.settings.palette_style = PaletteStyle::Classic.as_str().to_string();
+                self.snapshot.settings.theme_mode = "dark".to_string();
+                self.snapshot.settings.dynamic_theme = false;
+                self.cover_analysis = CoverHueAnalysis::default();
+                self.snapshot.save();
+                Task::none()
+            }
+            Message::ToggleDiscordRpc => {
+                self.snapshot.settings.discord_rpc = !self.snapshot.settings.discord_rpc;
+                self.last_discord_playing = None;
+                self.snapshot.save();
+                self.sync_discord_and_taskbar();
+                Task::none()
+            }
+            Message::ToggleDiscordArtistInStatus => {
+                self.snapshot.settings.discord_artist_in_status =
+                    !self.snapshot.settings.discord_artist_in_status;
+                self.last_discord_playing = None;
+                self.snapshot.save();
+                self.sync_discord_and_taskbar();
+                Task::none()
+            }
+            Message::ToggleMinimizeToTray => {
+                self.snapshot.settings.minimize_to_tray = !self.snapshot.settings.minimize_to_tray;
+                self.snapshot.save();
+                Task::none()
+            }
             Message::PlayTracks(tracks, idx) => {
                 if tracks.is_empty() {
                     return Task::none();
@@ -1562,11 +1842,75 @@ impl RaserApp {
                 }
             }
             Message::Tick => {
+                if let Some(ref tray) = self.tray_controller {
+                    tray.poll_events(&self.media_tx);
+                }
+                if let Some(ref hk) = self.hotkey_controller {
+                    hk.poll_events(&self.media_tx);
+                }
+
+                let mut pending_cmds = Vec::new();
+                while let Ok(cmd) = self.media_rx.try_recv() {
+                    pending_cmds.push(cmd);
+                }
+                for cmd in pending_cmds {
+                    let task = match cmd {
+                        MediaCommand::PlayPause => self.update(Message::TogglePlayPause),
+                        MediaCommand::Next => self.update(Message::NextTrack),
+                        MediaCommand::Previous => self.update(Message::PrevTrack),
+                        MediaCommand::Stop => {
+                            self.audio.stop();
+                            self.audio_state = self.audio.get_state();
+                            Task::none()
+                        }
+                        MediaCommand::ShowWindow => self.update(Message::ShowFromTray),
+                        MediaCommand::ToggleWindow => {
+                            if self.window_hidden_to_tray {
+                                self.update(Message::ShowFromTray)
+                            } else {
+                                self.update(Message::CloseWindow)
+                            }
+                        }
+                        MediaCommand::Quit => self.update(Message::QuitApp),
+                    };
+                    if let Some(_unused) = Option::<()>::None {
+                        let _ = task;
+                    }
+                    // For immediate playback/window tasks triggered asynchronously from tray/hotkeys:
+                    return task;
+                }
+
+                if self.window_hidden_to_tray
+                    && self.last_trim_at.elapsed() >= Duration::from_secs(30)
+                {
+                    memory::trim_working_set();
+                    self.last_trim_at = Instant::now();
+                }
+
                 let st = self.audio.get_state();
                 if st.playing {
                     self.scrubber_wave_phase =
                         (self.scrubber_wave_phase + 0.14) % std::f32::consts::TAU;
+                    let raw_fft = self.audio.get_frequency_data();
+                    visualizer::smooth_fft_bins(&mut self.fft_bins, &raw_fft, true);
+
+                    if self.m3_morph_progress > 0.0 {
+                        self.m3_morph_progress += 55.0 / MORPH_MS;
+                        if self.m3_morph_progress >= 1.0 {
+                            self.m3_morph_progress = 0.0;
+                            self.m3_hold_ms = 0.0;
+                            self.m3_shape_index = (self.m3_shape_index + 1) % M3CoverShape::ALL.len();
+                        }
+                    } else {
+                        self.m3_hold_ms += 55.0;
+                        if self.m3_hold_ms >= HOLD_MS {
+                            self.m3_morph_progress = 0.001;
+                        }
+                    }
+                } else {
+                    visualizer::smooth_fft_bins(&mut self.fft_bins, &[], false);
                 }
+
                 if let Some(pos) = self
                     .seek_coordinator
                     .accept_poll_position(self.seek_coordinator.seek_epoch, st.position)
@@ -1578,6 +1922,7 @@ impl RaserApp {
                     self.last_ended_reported = st.ended;
                 }
                 self.audio_state = st.clone();
+                self.sync_discord_and_taskbar();
 
                 // Enforce active TrackTrim during playback
                 if st.playing
