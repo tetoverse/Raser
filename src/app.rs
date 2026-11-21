@@ -2163,4 +2163,237 @@ mod tests {
         let _ = app.update(Message::SwitchView(ActiveView::Favorites));
         assert!(!app.search_focused);
     }
+
+    fn build_app_test_wav(path: &std::path::Path, duration_secs: u32) {
+        let sample_rate = 44100u32;
+        let num_samples = sample_rate * duration_secs;
+        let data_size = num_samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_size as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate as f32;
+            let sample = ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 8000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, &wav).unwrap();
+    }
+
+    #[test]
+    fn test_remove_paused_active_track_does_not_auto_advance_on_tick() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let guard = AppTestDirGuard::new("remove_paused_tick");
+        let wav_path = guard.dir.join("track_a.wav");
+        build_app_test_wav(&wav_path, 3);
+
+        let mut track_a = make_playable_track("A", "Track A");
+        track_a.path = wav_path.to_string_lossy().to_string();
+        track_a.url = track_a.path.clone();
+        track_a.duration = 3.0;
+        let track_b = make_playable_track("B", "Track B");
+        let track_c = make_playable_track("C", "Track C");
+
+        let (mut app, _) = RaserApp::boot(None);
+        let _ = app.audio.set_volume(0.0);
+        app.queue = vec![track_a.clone(), track_b, track_c];
+        app.queue_index = Some(0);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let load_res = rt.block_on(app.audio.load_audio_async(
+            track_a.playable_source(),
+            None,
+            Some(3.0),
+            true,
+            Some(track_a.id.clone()),
+        ));
+
+        match load_res {
+            Ok(_) => {
+                for _ in 0..24 {
+                    if app.audio.get_state().position > 0.16 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                app.audio_state = app.audio.get_state();
+                assert!(
+                    app.audio_state.position > 0.15,
+                    "expected >0.15s playback before pause, got {}",
+                    app.audio_state.position
+                );
+
+                // Pause via TogglePlayPause
+                let _ = app.update(Message::TogglePlayPause);
+                assert!(!app.audio_state.playing);
+
+                // Remove paused active track "A" and run Tick
+                let _ = app.update(Message::RemoveFromQueue(0));
+                let _ = app.update(Message::Tick);
+
+                assert_eq!(app.queue_index, Some(0));
+                assert_eq!(
+                    app.current_track().as_ref().map(|t| t.id.as_str()),
+                    Some("B")
+                );
+                assert!(!app.seek_coordinator.is_loading);
+                assert!(!app.audio_state.ended);
+                assert_eq!(app.audio_state.position, 0.0);
+            }
+            Err(e) if e.contains("default audio sink") => {
+                // Headless CI without audio device: still verify RemoveFromQueue + Tick doesn't advance
+                let _ = app.update(Message::RemoveFromQueue(0));
+                let _ = app.update(Message::Tick);
+                assert_eq!(app.queue_index, Some(0));
+                assert_eq!(
+                    app.current_track().as_ref().map(|t| t.id.as_str()),
+                    Some("B")
+                );
+                assert!(!app.seek_coordinator.is_loading);
+                assert!(!app.audio_state.ended);
+            }
+            Err(e) => panic!("Unexpected load_audio_async error: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_toggle_play_pause_loads_unloaded_queue_track_on_boot_and_paused_remove() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let guard = AppTestDirGuard::new("toggle_play_unloaded");
+        let wav_path = guard.dir.join("boot_track.wav");
+        build_app_test_wav(&wav_path, 2);
+
+        let mut track_a = make_playable_track("A", "Track A");
+        track_a.path = wav_path.to_string_lossy().to_string();
+        track_a.url = track_a.path.clone();
+        track_a.duration = 2.0;
+        let track_b = make_playable_track("B", "Track B");
+
+        // (a) Cold boot with persisted devsize_queue (url.is_none())
+        let storage_json = serde_json::json!({
+            "devsize_queue": serde_json::to_string(&vec![&track_a, &track_b]).unwrap()
+        });
+        std::fs::write(
+            guard.dir.join("storage.json"),
+            serde_json::to_string(&storage_json).unwrap(),
+        )
+        .unwrap();
+
+        let (mut app, _) = RaserApp::boot(None);
+        assert_eq!(app.queue_index, Some(0));
+        assert!(app.audio_state.url.is_none());
+        assert!(!app.seek_coordinator.is_loading);
+
+        let _ = app.update(Message::TogglePlayPause);
+        assert!(app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+
+        // Second TogglePlayPause while still loading (url.is_none()) must not corrupt playing
+        let _ = app.update(Message::TogglePlayPause);
+        assert!(app.seek_coordinator.is_loading);
+        assert!(!app.audio_state.playing);
+
+        // (b) Paused RemoveFromQueue(0) then TogglePlayPause initiates load for Track B
+        let (mut app2, _) = RaserApp::boot(None);
+        let _ = app2.audio.set_volume(0.0);
+        app2.queue = vec![track_a.clone(), track_b];
+        app2.queue_index = Some(0);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _ = rt.block_on(app2.audio.load_audio_async(
+            track_a.playable_source(),
+            None,
+            Some(2.0),
+            false,
+            Some(track_a.id.clone()),
+        ));
+        app2.audio_state = app2.audio.get_state();
+        assert!(!app2.audio_state.playing);
+
+        let _ = app2.update(Message::RemoveFromQueue(0));
+        assert_eq!(app2.queue_index, Some(0));
+        assert_eq!(
+            app2.current_track().as_ref().map(|t| t.id.as_str()),
+            Some("B")
+        );
+        assert!(app2.audio_state.url.is_none());
+        assert!(!app2.seek_coordinator.is_loading);
+
+        let _ = app2.update(Message::TogglePlayPause);
+        assert!(app2.seek_coordinator.is_loading);
+        assert!(!app2.audio_state.playing);
+    }
+
+    #[test]
+    fn test_remove_local_track_records_legacy_extra_filepath() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("remove_local_filepath");
+        let (mut app, _) = RaserApp::boot(None);
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "filePath".to_string(),
+            serde_json::Value::String(r"C:\Music\Legacy\Song.mp3".to_string()),
+        );
+        let legacy_track = TrackRecord {
+            id: "legacy_fp_1".to_string(),
+            title: "Legacy Song".to_string(),
+            artist: "Legacy Artist".to_string(),
+            platform: "local".to_string(),
+            path: String::new(),
+            url: String::new(),
+            extra,
+            ..Default::default()
+        };
+
+        app.snapshot.local_tracks = vec![legacy_track.clone()];
+        app.snapshot.save();
+
+        let _ = app.update(Message::RemoveLocalTrack(legacy_track));
+        assert!(app.snapshot.local_tracks.is_empty());
+        assert!(app
+            .snapshot
+            .removed_local_paths
+            .contains(&r"C:\Music\Legacy\Song.mp3".to_string()));
+
+        // Ensure reloaded snapshot keeps the legacy track filtered out
+        let reloaded = AppStateSnapshot::load();
+        assert!(reloaded.local_tracks.is_empty());
+        assert!(reloaded
+            .removed_local_paths
+            .contains(&r"C:\Music\Legacy\Song.mp3".to_string()));
+    }
+
+    #[test]
+    fn test_focus_search_box_ignores_stale_system_event_unfocus() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = AppTestDirGuard::new("search_focus_race");
+        let (mut app, _) = RaserApp::boot(None);
+
+        let _ = app.update(Message::FocusSearchBox);
+        assert!(app.search_focused);
+        assert!(app.focus_search_pending);
+
+        // Stale SearchFocused(false) racing on the same click must not clear search_focused
+        let _ = app.update(Message::SearchFocused(false));
+        assert!(app.search_focused);
+
+        // Once FocusSearchBox's chained focus check resolves, pending flag clears
+        let _ = app.update(Message::SearchFocusResolved(true));
+        assert!(app.search_focused);
+        assert!(!app.focus_search_pending);
+
+        // Subsequent click outside can now unfocus normally
+        let _ = app.update(Message::SearchFocused(false));
+        assert!(!app.search_focused);
+    }
 }
