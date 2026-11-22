@@ -1317,7 +1317,14 @@ impl AudioCore {
         let error = self.current_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let track_played = self.track_has_played.load(Ordering::SeqCst);
-        let ended = if !loading && !seeking && empty && track_played {
+        let stream_still_downloading = self
+            .active_progressive
+            .try_lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(s, _)| s.state.lock().ok().map(|st| !st.finished).unwrap_or(false)))
+            .unwrap_or(false);
+        let not_near_end = duration > 5.0 && (pos + 3.0) < duration;
+        let ended = if !loading && !seeking && empty && track_played && !stream_still_downloading && !not_near_end {
             self.has_ended.store(true, Ordering::SeqCst);
             self.is_playing.store(false, Ordering::SeqCst);
             true
