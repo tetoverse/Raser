@@ -4,15 +4,17 @@ Native Windows desktop music player built with Tauri v2 and Rust. Streams from Y
 
 ## Overview
 
-Raser offloads audio decoding, streaming, and frequency analysis to a native Rust backend (`rodio`, `symphonia`, `rustfft`) instead of running Web Audio inside Chromium. When minimized to the system tray, UI render loops pause and memory is trimmed.
+Raser offloads audio decoding, streaming, and frequency analysis to a native Rust backend (`rodio`, `symphonia`, `rustfft`) instead of running Web Audio inside Chromium. When closed to the system tray (v2.0.0+), WebView2 is completely unloaded (`0` `msedgewebview2.exe` processes) while music playback, queue auto-advance, media keys, and Discord Rich Presence continue running in Rust.
 
 | Metric | Raser | Typical Electron Player |
 | :--- | :--- | :--- |
-| Idle RAM (tray) | ~35–55 MB | 450–750 MB |
-| Active Playback RAM | ~75–110 MB | 600–950 MB |
+| Idle RAM (tray, zero WebView2) | **1–25 MB** | 450–750 MB |
+| Open Window RAM | ~250–300 MB | 600–950 MB |
 | Installer Size | ~8 MB | 120–180 MB |
 | Cold Start | < 0.6 s | 3.5–6.0 s |
 | Audio Engine | Rust (`rodio` + WASAPI) | Web Audio API |
+
+![Raser tray memory usage in Task Manager](assets/tray-ram-v2.png)
 
 ## Features
 
@@ -93,6 +95,7 @@ Raser/
 │   │   ├── main.rs            # Application entry point
 │   │   ├── lib.rs             # Tauri commands and background monitors
 │   │   ├── audio_core.rs      # Rust audio engine (rodio, symphonia, FFT)
+│   │   ├── bg_queue.rs        # Headless Rust background queue & stream resolver
 │   │   ├── discord.rs         # Discord Rich Presence IPC
 │   │   ├── taskbar.rs         # Windows taskbar thumbnail controls
 │   │   ├── storage.rs         # Local JSON storage
