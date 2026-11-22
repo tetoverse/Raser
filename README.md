@@ -14,7 +14,9 @@ Raser offloads audio decoding, streaming, and frequency analysis to a native Rus
 | Cold Start | < 0.6 s | 3.5–6.0 s |
 | Audio Engine | Rust (`rodio` + WASAPI) | Web Audio API |
 
-![Raser tray memory usage in Task Manager](assets/tray-ram-v2.png)
+| Open Window | Tray Sleep (Zero WebView2) |
+| :---: | :---: |
+| ![Raser open window memory usage](assets/open-ram-v2.png) | ![Raser tray memory usage in Task Manager](assets/tray-ram-v2.png) |
 
 ## Features
 
