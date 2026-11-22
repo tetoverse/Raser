@@ -537,9 +537,9 @@ impl AudioCore {
         match (total_dur, hint) {
             (Some(total), Some(h)) => {
                 let total_secs = total.as_secs_f64();
-                // If decoder-reported duration wildly diverges from metadata hint
+                // If decoder-reported duration diverges from metadata hint
                 // (e.g. VBR/fragmented stream misestimation), prefer the metadata hint.
-                if h > 1.0 && (total_secs - h).abs() > (h * 0.6).max(120.0) {
+                if h > 1.0 && (total_secs - h).abs() > (h * 0.15).max(15.0) {
                     h
                 } else {
                     total_secs
@@ -906,6 +906,8 @@ impl AudioCore {
                 Progressive(Decoder<ProgressiveReader>),
             }
 
+            let mut server_duration: Option<f64> = None;
+
             let loaded_decoder = if cached_bytes_opt.is_none()
                 && (url.starts_with("http://") || url.starts_with("https://"))
             {
@@ -944,6 +946,15 @@ impl AudioCore {
                 }
 
                 *this.cached_bytes.lock().unwrap() = None;
+
+                if let Some(hdr_val) = resp.headers().get("x-audio-duration").and_then(|v| v.to_str().ok()) {
+                    if let Ok(parsed_dur) = hdr_val.trim().parse::<f64>() {
+                        if parsed_dur.is_finite() && parsed_dur > 0.0 {
+                            server_duration = Some(parsed_dur);
+                            *this.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = parsed_dur;
+                        }
+                    }
+                }
 
                 let total_len = resp.content_length();
                 let initial_cap = total_len
@@ -1131,7 +1142,11 @@ impl AudioCore {
                 LoadedDecoder::Progressive(d) => d.total_duration(),
             };
 
-            let resolved_dur = AudioCore::resolve_duration(total_dur, duration_hint);
+            let resolved_dur = if let Some(exact) = server_duration {
+                exact
+            } else {
+                AudioCore::resolve_duration(total_dur, duration_hint)
+            };
             if resolved_dur > 0.0 {
                 *this.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = resolved_dur;
             }
