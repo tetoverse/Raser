@@ -28434,28 +28434,69 @@ function bindCoverHoldZoom(wrapEl) {
     }
   }
 
-  async function repairSavedLibraryTracksOnce() {
+  async function repairSavedLibraryTracksV3() {
     try {
-      if (localStorage.getItem('raser_library_repair_v2') === '1') return;
+      if (localStorage.getItem('raser_library_repair_v3') === '1') return;
+      const isRealYtId = (id) => typeof id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(id) && !/^(cand_|dz_|it_|sp_|ym_)/i.test(id);
+
+      // Step 1: Restore any real 11-char YouTube IDs whose resolvedId was previously overwritten
+      let restoredAny = false;
+      const restoreNativeYtIds = (arr) => {
+        if (!Array.isArray(arr)) return false;
+        let ch = false;
+        for (const t of arr) {
+          if (!t || typeof t !== 'object') continue;
+          if (isRealYtId(t.id) && t.resolvedId && t.resolvedId !== t.id) {
+            t.resolvedId = t.id;
+            t.url = `https://www.youtube.com/watch?v=${t.id}`;
+            delete t._preloadedStreamUrl;
+            ch = true;
+            restoredAny = true;
+          }
+        }
+        return ch;
+      };
+      if (restoreNativeYtIds(state.favorites)) {
+        try { localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites)); } catch (_) {}
+      }
+      if (restoreNativeYtIds(state.history)) {
+        try { localStorage.setItem('devsize_history', JSON.stringify(state.history)); } catch (_) {}
+      }
+      if (Array.isArray(state.playlists)) {
+        let plRestored = false;
+        for (const p of state.playlists) {
+          if (p && restoreNativeYtIds(p.tracks)) plRestored = true;
+        }
+        if (plRestored) {
+          try { localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists)); } catch (_) {}
+        }
+      }
+      restoreNativeYtIds(state.queue);
+
+      // Step 2: Only resolve non-YouTube external tracks (sp_*, dz_*, it_*, cand_*, etc.)
       const seen = new Map();
-      const collect = (arr) => {
+      const collectExternal = (arr) => {
         if (!Array.isArray(arr)) return;
         for (const t of arr) {
           if (!t || typeof t !== 'object') continue;
           if (t.platform === 'local' || t.platform === 'soundcloud') continue;
+          if (isRealYtId(t.id)) continue; // NEVER overwrite real YouTube video IDs!
           const key = String(t.id || `${t.artist || ''}::${t.title || ''}`).trim();
           if (!key || (!t.title && !t.artist)) continue;
-          if (!seen.has(key)) seen.set(key, { key, title: t.title || '', artist: t.artist || '' });
+          const durHint = (Number.isFinite(Number(t.duration)) && Number(t.duration) > 10 && Number(t.duration) !== 180)
+            ? Math.round(Number(t.duration))
+            : 0;
+          if (!seen.has(key)) seen.set(key, { key, title: t.title || '', artist: t.artist || '', duration: durHint });
         }
       };
-      collect(state.favorites);
-      collect(state.history);
+      collectExternal(state.favorites);
+      collectExternal(state.history);
       if (Array.isArray(state.playlists)) {
-        for (const p of state.playlists) collect(p && p.tracks);
+        for (const p of state.playlists) collectExternal(p && p.tracks);
       }
       const items = Array.from(seen.values());
       if (items.length === 0) {
-        localStorage.setItem('raser_library_repair_v2', '1');
+        localStorage.setItem('raser_library_repair_v3', '1');
         return;
       }
 
@@ -28480,6 +28521,7 @@ function bindCoverHoldZoom(wrapEl) {
         let ch = false;
         for (const t of arr) {
           if (!t || typeof t !== 'object' || t.platform === 'local' || t.platform === 'soundcloud') continue;
+          if (isRealYtId(t.id)) continue;
           const key = String(t.id || `${t.artist || ''}::${t.title || ''}`).trim();
           const info = repairedMap[key];
           if (!info) continue;
@@ -28513,17 +28555,17 @@ function bindCoverHoldZoom(wrapEl) {
         }
       }
       applyRepair(state.queue);
-      if (Object.keys(repairedMap).length > 0) {
+      if (restoredAny || Object.keys(repairedMap).length > 0) {
         try {
           if (state.currentView === 'favorites' && typeof renderFavorites === 'function') renderFavorites();
           else if (state.currentView === 'history' && typeof renderHistoryView === 'function') renderHistoryView();
           else if (state.currentView === 'playlist-detail' && state.currentPlaylistId && typeof openPlaylistDetail === 'function') openPlaylistDetail(state.currentPlaylistId);
         } catch (_) {}
       }
-      localStorage.setItem('raser_library_repair_v2', '1');
+      localStorage.setItem('raser_library_repair_v3', '1');
     } catch (_) {}
   }
-  setTimeout(repairSavedLibraryTracksOnce, 4500);
+  setTimeout(repairSavedLibraryTracksV3, 4500);
 
   resumeFromRustSnapshotIfPresent();
   emitPluginEvent('ready');

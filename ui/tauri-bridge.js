@@ -269,7 +269,7 @@
             if (Number.isFinite(state.currentTrack.duration) && state.currentTrack.duration > 0) {
               durHint = state.currentTrack.duration;
             }
-            trackId = (typeof getTrackCanonicalId === 'function' ? getTrackCanonicalId(state.currentTrack) : '') || state.currentTrack.id || state.currentTrack.resolvedId || null;
+            trackId = state.currentTrack.resolvedId || state.currentTrack.id || (typeof getTrackCanonicalId === 'function' ? getTrackCanonicalId(state.currentTrack) : '') || null;
           }
         } catch (_) {}
 
