@@ -28279,16 +28279,29 @@ function bindCoverHoldZoom(wrapEl) {
   }
 
   let _rustSnapshotTimer = null;
+  function sanitizeTrackForRust(t) {
+    if (!t || typeof t !== 'object') return null;
+    return {
+      id: t.id != null ? String(t.id) : '',
+      resolvedId: t.resolvedId != null ? String(t.resolvedId) : null,
+      title: t.title != null ? String(t.title) : '',
+      artist: Array.isArray(t.artist) ? t.artist.join(', ') : (t.artist != null ? String(t.artist) : ''),
+      thumbnail: typeof t.thumbnail === 'string' ? t.thumbnail : null,
+      duration: Number.isFinite(Number(t.duration)) ? Number(t.duration) : null,
+      platform: typeof t.platform === 'string' ? t.platform : null,
+      url: typeof t.url === 'string' ? t.url : null,
+      path: typeof t.path === 'string' ? t.path : null,
+      searchQuery: typeof t.searchQuery === 'string' ? t.searchQuery : null,
+      explicit: !!t.explicit
+    };
+  }
+
   function buildRustPlaybackSnapshot() {
     const safeQueue = Array.isArray(state.queue)
-      ? state.queue.slice(0, 250).map(t => {
-          if (!t || typeof t !== 'object') return null;
-          const out = { ...t };
-          delete out._blobUrl;
-          return out;
-        }).filter(Boolean)
+      ? state.queue.slice(0, 250).map(sanitizeTrackForRust).filter(Boolean)
       : [];
     return {
+      currentTrack: sanitizeTrackForRust(state.currentTrack),
       queue: safeQueue,
       queueIndex: typeof state.queueIndex === 'number' ? state.queueIndex : -1,
       repeatMode: state.repeatMode || 'off',
@@ -28333,10 +28346,15 @@ function bindCoverHoldZoom(wrapEl) {
     if (document.hidden) syncPlaybackSnapshotToRust(true);
   });
 
-  function resumeFromRustSnapshotIfPresent() {
-    const payload = window.__RASER_RESUME_SNAPSHOT__;
-    if (!payload || !payload.wasResumed || !payload.snapshot) return;
+  async function resumeFromRustSnapshotIfPresent() {
+    let payload = window.__RASER_RESUME_SNAPSHOT__;
     window.__RASER_RESUME_SNAPSHOT__ = null;
+    if ((!payload || !payload.wasResumed || !payload.snapshot) && window.electronAPI && typeof window.electronAPI.getResumeSnapshot === 'function') {
+      try {
+        payload = await window.electronAPI.getResumeSnapshot();
+      } catch (_) {}
+    }
+    if (!payload || !payload.wasResumed || !payload.snapshot) return;
 
     const snap = payload.snapshot;
     const audioSt = payload.audioState || {};
@@ -28352,7 +28370,9 @@ function bindCoverHoldZoom(wrapEl) {
     }
     state.isShuffle = !!snap.isShuffle;
 
-    const activeTrack = (state.queueIndex >= 0 && state.queue[state.queueIndex]) ? state.queue[state.queueIndex] : null;
+    const activeTrack = (state.queueIndex >= 0 && state.queue[state.queueIndex])
+      ? state.queue[state.queueIndex]
+      : (snap.currentTrack || null);
     if (activeTrack) {
       state.currentTrack = activeTrack;
       state.isPlaying = !!audioSt.playing;

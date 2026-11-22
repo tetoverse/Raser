@@ -1,32 +1,69 @@
 use crate::{audio_core, discord};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn deserialize_lossy_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => s,
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    })
+}
+
+fn deserialize_lossy_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+fn deserialize_lossy_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueueTrack {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string")]
     pub id: String,
-    #[serde(default, rename = "resolvedId")]
+    #[serde(default, rename = "resolvedId", deserialize_with = "deserialize_lossy_opt_string")]
     pub resolved_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_string")]
     pub artist: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_opt_string")]
     pub thumbnail: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_opt_f64")]
     pub duration: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_opt_string")]
     pub platform: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_opt_string")]
     pub url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lossy_opt_string")]
     pub path: Option<String>,
-    #[serde(default, rename = "_preloadedStreamUrl")]
+    #[serde(default, rename = "_preloadedStreamUrl", deserialize_with = "deserialize_lossy_opt_string")]
     pub preloaded_stream_url: Option<String>,
-    #[serde(default, rename = "searchQuery")]
+    #[serde(default, rename = "searchQuery", deserialize_with = "deserialize_lossy_opt_string")]
     pub search_query: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -48,6 +85,8 @@ impl QueueTrack {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaybackSnapshot {
+    #[serde(default, rename = "currentTrack")]
+    pub current_track: Option<QueueTrack>,
     #[serde(default)]
     pub queue: Vec<QueueTrack>,
     #[serde(default, rename = "queueIndex")]
@@ -99,6 +138,7 @@ fn default_true() -> bool {
 impl Default for PlaybackSnapshot {
     fn default() -> Self {
         Self {
+            current_track: None,
             queue: Vec::new(),
             queue_index: -1,
             repeat_mode: default_repeat_mode(),
@@ -215,10 +255,11 @@ impl BackgroundQueue {
     pub fn current_track(&self) -> Option<QueueTrack> {
         let g = self.inner.lock().ok()?;
         if g.snapshot.queue_index >= 0 {
-            g.snapshot.queue.get(g.snapshot.queue_index as usize).cloned()
-        } else {
-            None
+            if let Some(t) = g.snapshot.queue.get(g.snapshot.queue_index as usize) {
+                return Some(t.clone());
+            }
         }
+        g.snapshot.current_track.clone()
     }
 
     pub fn discord_settings(&self) -> (bool, bool) {
@@ -230,9 +271,10 @@ impl BackgroundQueue {
 
     pub fn build_resume_payload(&self, audio_state: audio_core::AudioState) -> Option<ResumePayload> {
         let g = self.inner.lock().ok()?;
-        let has_track = g.snapshot.queue_index >= 0
+        let has_queue_track = g.snapshot.queue_index >= 0
             && (g.snapshot.queue_index as usize) < g.snapshot.queue.len();
-        if !has_track {
+        let has_current = g.snapshot.current_track.is_some();
+        if !has_queue_track && !has_current {
             return None;
         }
         Some(ResumePayload {
@@ -332,6 +374,7 @@ impl BackgroundQueue {
         }
 
         let track = g.snapshot.queue[target_idx].clone();
+        g.snapshot.current_track = Some(track.clone());
         Some((
             track,
             target_idx,
