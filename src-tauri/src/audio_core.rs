@@ -614,6 +614,28 @@ impl AudioCore {
         .map_err(|_| "Audio decoder panicked during seek".to_string())?
     }
 
+    fn build_progressive_decoder(
+        shared_prog: &Arc<SharedProgressive>,
+        reader: ProgressiveReader,
+        coarse_seek: bool,
+    ) -> Result<Decoder<ProgressiveReader>, rodio::decoder::DecoderError> {
+        let total_len = shared_prog
+            .state
+            .lock()
+            .ok()
+            .and_then(|st| st.total_len.or_else(|| if st.finished { Some(st.data.len() as u64) } else { None }));
+        let mut builder = Decoder::builder().with_data(reader).with_seekable(true);
+        if let Some(len) = total_len {
+            if len > 0 {
+                builder = builder.with_byte_len(len);
+            }
+        }
+        if coarse_seek {
+            builder = builder.with_coarse_seek(true);
+        }
+        builder.build()
+    }
+
     fn prepare_seeked_progressive_decoder(
         shared_prog: &Arc<SharedProgressive>,
         prog_gen: u64,
@@ -631,7 +653,7 @@ impl AudioCore {
                 my_seek_gen,
                 Arc::clone(&preparing),
             );
-            let mut decoder = Decoder::new(reader)
+            let mut decoder = Self::build_progressive_decoder(shared_prog, reader, false)
                 .map_err(|e| format!("Stream decoder initialization failed during seek: {:?}", e))?;
             if target_pos <= Duration::from_millis(50) {
                 return Ok((decoder, 0.0, preparing));
@@ -646,10 +668,7 @@ impl AudioCore {
                         my_seek_gen,
                         Arc::clone(&preparing),
                     );
-                    let mut coarse_decoder = Decoder::builder()
-                        .with_data(coarse_reader)
-                        .with_coarse_seek(true)
-                        .build()
+                    let mut coarse_decoder = Self::build_progressive_decoder(shared_prog, coarse_reader, true)
                         .map_err(|err| format!("Coarse stream decoder init failed: {:?}", err))?;
                     coarse_decoder
                         .try_seek(target_pos)
@@ -782,6 +801,22 @@ impl AudioCore {
             self.active_progressive.lock().map_err(|e| e.to_string())?.clone()
         {
             if prog_gen == expected_load_gen && self.is_seek_current(my_seek_gen, expected_load_gen) {
+                // If progressive download already finished, upgrade directly to zero-copy Buffered seek
+                let finished_bytes = shared_prog.state.lock().ok().and_then(|st| {
+                    if st.finished && !st.data.is_empty() {
+                        Some(Arc::new(st.data.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some(bytes_arc) = finished_bytes {
+                    *self.cached_bytes.lock().map_err(|e| e.to_string())? = Some(Arc::clone(&bytes_arc));
+                    let (decoder, actual_offset) =
+                        Self::prepare_seeked_buffered_decoder(&bytes_arc, target_pos, clamped_pos)?;
+                    self.commit_seeked_source(decoder, actual_offset, my_seek_gen, expected_load_gen, None)?;
+                    return Ok(self.get_state());
+                }
+
                 let (decoder, actual_offset, preparing) = Self::prepare_seeked_progressive_decoder(
                     &shared_prog,
                     prog_gen,
@@ -1001,6 +1036,18 @@ impl AudioCore {
                                     if this_dl.load_generation.load(Ordering::SeqCst) == current_gen {
                                         let bytes_arc = Arc::new(full_bytes);
                                         *this_dl.cached_bytes.lock().unwrap() = Some(Arc::clone(&bytes_arc));
+                                        // Refine duration from complete buffered audio if current duration was missing or looked misestimated (>10 min)
+                                        let cur_d = *this_dl.current_duration.lock().unwrap_or_else(|e| e.into_inner());
+                                        if cur_d <= 0.0 || cur_d > 600.0 {
+                                            if let Ok(d_check) = AudioCore::build_buffered_decoder(&bytes_arc, false) {
+                                                if let Some(exact) = d_check.total_duration() {
+                                                    let exact_s = exact.as_secs_f64();
+                                                    if exact_s.is_finite() && exact_s > 1.0 && (cur_d <= 0.0 || (cur_d - exact_s).abs() > 15.0) {
+                                                        *this_dl.current_duration.lock().unwrap_or_else(|e| e.into_inner()) = exact_s;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if let Some(ref tid) = tid_dl {
                                             storage::save_cached_audio(tid, &bytes_arc);
                                         }
@@ -1068,7 +1115,7 @@ impl AudioCore {
                 }
 
                 let reader = ProgressiveReader::new(Arc::clone(&shared), current_gen);
-                let decoder = match Decoder::new(reader) {
+                let decoder = match Self::build_progressive_decoder(&shared, reader, false) {
                     Ok(d) => d,
                     Err(e) => {
                         let err_msg = format!("Audio decoder error for {}: {:?}", url, e);
