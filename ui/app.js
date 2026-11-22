@@ -9077,7 +9077,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       const audio = el.nativeAudio;
       const metaDur = (state.currentTrack && Number.isFinite(state.currentTrack.duration) && state.currentTrack.duration > 0) ? state.currentTrack.duration : 0;
       const audioDur = (audio && Number.isFinite(audio.duration) && audio.duration > 1) ? audio.duration : 0;
-      if (state.currentTrack && audioDur > 1 && isTrackDurationCompatible(metaDur, audioDur)) {
+      const isRustNative = !!(window.electronAPI && window.electronAPI.isTauri);
+      if (state.currentTrack && audioDur > 1 && (isRustNative || isTrackDurationCompatible(metaDur, audioDur))) {
         const newDur = Math.round(audioDur);
         state.currentTrack.duration = newDur;
         const tid = state.currentTrack.id;
@@ -9085,11 +9086,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           state.queue.forEach((t) => { if (t && t.id === tid) t.duration = newDur; });
         }
         if (Array.isArray(state.playlists)) {
+          let plChanged = false;
           state.playlists.forEach((p) => {
             if (p && Array.isArray(p.tracks)) {
-              p.tracks.forEach((t) => { if (t && t.id === tid) t.duration = newDur; });
+              p.tracks.forEach((t) => { if (t && t.id === tid && t.duration !== newDur) { t.duration = newDur; plChanged = true; } });
             }
           });
+          if (plChanged) { try { localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists)); } catch (_) {} }
+        }
+        if (Array.isArray(state.favorites)) {
+          let favChanged = false;
+          state.favorites.forEach((t) => { if (t && t.id === tid && t.duration !== newDur) { t.duration = newDur; favChanged = true; } });
+          if (favChanged) { try { localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites)); } catch (_) {} }
         }
       }
       const d = formatDuration(getReliableTrackDuration());
@@ -9231,7 +9239,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       const audio = el.nativeAudio;
       const metaDur = (state.currentTrack && Number.isFinite(state.currentTrack.duration) && state.currentTrack.duration > 0) ? state.currentTrack.duration : 0;
       const audioDur = (!state.audioDurationStale && audio && Number.isFinite(audio.duration) && audio.duration > 1) ? audio.duration : 0;
-      if (state.currentTrack && audioDur > 1 && isTrackDurationCompatible(metaDur, audioDur)) {
+      const isRustNative = !!(window.electronAPI && window.electronAPI.isTauri);
+      if (state.currentTrack && audioDur > 1 && (isRustNative || isTrackDurationCompatible(metaDur, audioDur))) {
         const newDur = Math.round(audioDur);
         state.currentTrack.duration = newDur;
         const tid = state.currentTrack.id;
@@ -9239,11 +9248,18 @@ document.addEventListener('DOMContentLoaded', async () => {
           state.queue.forEach((t) => { if (t && t.id === tid) t.duration = newDur; });
         }
         if (Array.isArray(state.playlists)) {
+          let plChanged = false;
           state.playlists.forEach((p) => {
             if (p && Array.isArray(p.tracks)) {
-              p.tracks.forEach((t) => { if (t && t.id === tid) t.duration = newDur; });
+              p.tracks.forEach((t) => { if (t && t.id === tid && t.duration !== newDur) { t.duration = newDur; plChanged = true; } });
             }
           });
+          if (plChanged) { try { localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists)); } catch (_) {} }
+        }
+        if (Array.isArray(state.favorites)) {
+          let favChanged = false;
+          state.favorites.forEach((t) => { if (t && t.id === tid && t.duration !== newDur) { t.duration = newDur; favChanged = true; } });
+          if (favChanged) { try { localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites)); } catch (_) {} }
         }
       }
       if (el.timeDuration) el.timeDuration.textContent = formatDuration(getReliableTrackDuration());
@@ -28417,6 +28433,97 @@ function bindCoverHoldZoom(wrapEl) {
       } catch (_) {}
     }
   }
+
+  async function repairSavedLibraryTracksOnce() {
+    try {
+      if (localStorage.getItem('raser_library_repair_v2') === '1') return;
+      const seen = new Map();
+      const collect = (arr) => {
+        if (!Array.isArray(arr)) return;
+        for (const t of arr) {
+          if (!t || typeof t !== 'object') continue;
+          if (t.platform === 'local' || t.platform === 'soundcloud') continue;
+          const key = String(t.id || `${t.artist || ''}::${t.title || ''}`).trim();
+          if (!key || (!t.title && !t.artist)) continue;
+          if (!seen.has(key)) seen.set(key, { key, title: t.title || '', artist: t.artist || '' });
+        }
+      };
+      collect(state.favorites);
+      collect(state.history);
+      if (Array.isArray(state.playlists)) {
+        for (const p of state.playlists) collect(p && p.tracks);
+      }
+      const items = Array.from(seen.values());
+      if (items.length === 0) {
+        localStorage.setItem('raser_library_repair_v2', '1');
+        return;
+      }
+
+      const repairedMap = {};
+      for (let i = 0; i < items.length; i += 25) {
+        const batch = items.slice(i, i + 25);
+        try {
+          const res = await fetch(`${getApiBaseUrl()}/api/resolve-durations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tracks: batch })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.tracks) Object.assign(repairedMap, data.tracks);
+          }
+        } catch (_) {}
+      }
+
+      const applyRepair = (arr) => {
+        if (!Array.isArray(arr)) return false;
+        let ch = false;
+        for (const t of arr) {
+          if (!t || typeof t !== 'object' || t.platform === 'local' || t.platform === 'soundcloud') continue;
+          const key = String(t.id || `${t.artist || ''}::${t.title || ''}`).trim();
+          const info = repairedMap[key];
+          if (!info) continue;
+          if (info.id && t.resolvedId !== info.id) {
+            t.resolvedId = info.id;
+            t.url = `https://www.youtube.com/watch?v=${info.id}`;
+            delete t._preloadedStreamUrl;
+            ch = true;
+          }
+          if (info.duration && info.duration > 0 && t.duration !== info.duration) {
+            t.duration = info.duration;
+            ch = true;
+          }
+        }
+        return ch;
+      };
+
+      if (applyRepair(state.favorites)) {
+        try { localStorage.setItem('devsize_favorites', JSON.stringify(state.favorites)); } catch (_) {}
+      }
+      if (applyRepair(state.history)) {
+        try { localStorage.setItem('devsize_history', JSON.stringify(state.history)); } catch (_) {}
+      }
+      if (Array.isArray(state.playlists)) {
+        let plCh = false;
+        for (const p of state.playlists) {
+          if (p && applyRepair(p.tracks)) plCh = true;
+        }
+        if (plCh) {
+          try { localStorage.setItem('devsize_playlists', JSON.stringify(state.playlists)); } catch (_) {}
+        }
+      }
+      applyRepair(state.queue);
+      if (Object.keys(repairedMap).length > 0) {
+        try {
+          if (state.currentView === 'favorites' && typeof renderFavorites === 'function') renderFavorites();
+          else if (state.currentView === 'history' && typeof renderHistoryView === 'function') renderHistoryView();
+          else if (state.currentView === 'playlist-detail' && state.currentPlaylistId && typeof openPlaylistDetail === 'function') openPlaylistDetail(state.currentPlaylistId);
+        } catch (_) {}
+      }
+      localStorage.setItem('raser_library_repair_v2', '1');
+    } catch (_) {}
+  }
+  setTimeout(repairSavedLibraryTracksOnce, 4500);
 
   resumeFromRustSnapshotIfPresent();
   emitPluginEvent('ready');
