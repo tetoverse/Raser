@@ -8,8 +8,8 @@ Raser offloads audio decoding, streaming, and frequency analysis to a native Rus
 
 | Metric | Raser | Typical Electron Player |
 | :--- | :--- | :--- |
-| Idle RAM (tray, zero WebView2) | **1–25 MB** | 450–750 MB |
-| Open Window RAM | ~250–300 MB | 600–950 MB |
+| Idle RAM (tray, zero WebView2) | **1.3 MB** (idle) / ~15–25 MB (playing) | 450–750 MB |
+| Open Window RAM | **~301 MB** (`296.7 MB` WebView2 + `4.7 MB` Raser) | 600–950 MB |
 | Installer Size | ~8 MB | 120–180 MB |
 | Cold Start | < 0.6 s | 3.5–6.0 s |
 | Audio Engine | Rust (`rodio` + WASAPI) | Web Audio API |
